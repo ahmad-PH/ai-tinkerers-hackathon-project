@@ -4,6 +4,7 @@ import re
 import hashlib
 import json
 import os
+import logging
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -14,8 +15,17 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.genai import types
 from mcp import StdioServerParameters
+from opik import configure
+from opik.integrations.adk import OpikTracer
+from src.rerank.rerank import Paper, rerank
+
+configure()
 
 load_dotenv()  # Load environment variables from .env file if present
+
+# Reduce noise from ADK/MCP internals; keep warnings+errors
+for noisy in ("mcp", "google.adk.tools.mcp_tool", "google.adk", "httpx"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 APP_NAME = "research_assistant_app"
 USER_ID = "local_user"
@@ -25,13 +35,36 @@ SESSION_ID = "default_session"
 st.set_page_config(page_title="Research Assistant", page_icon="📚", layout="wide")
 
 
+@st.cache_resource
+def get_asyncio_runner() -> asyncio.Runner:
+    # One runner (and event loop) for the lifetime of the Streamlit session
+    return asyncio.Runner()
+
+
+@st.cache_resource
+def create_tracer():
+    # You can tweak these fields (tags, metadata, project_name) to your needs.
+    return OpikTracer(
+        name="research-assistant-tracer",
+        tags=["streamlit", "arxiv", "mcp", "adk"],
+        metadata={
+            "environment": "development",
+            "framework": "google-adk",
+            "feature": "research-assistant",
+        },
+        project_name="adk-research-assistant",
+    )
+
+
 # Initialize agent (cached to avoid recreating on every rerun)
 @st.cache_resource
 def create_agent():
     """Create the ADK agent with arXiv MCP toolset"""
+    tracer = create_tracer()
+
     agent = LlmAgent(
-        model='gemini-2.5-flash-lite',
-        name='research_assistant',
+        model="gemini-2.5-flash-lite",
+        name="research_assistant",
         instruction="""You are a research assistant that helps users find academic papers.
 
 When the user provides a research topic or question:
@@ -46,13 +79,19 @@ Format your responses as markdown for better readability.""",
             McpToolset(
                 connection_params=StdioConnectionParams(
                     server_params=StdioServerParameters(
-                        command='uv',
-                        args=['tool', 'run', 'arxiv-mcp-server'],
+                        command="uv",
+                        args=["tool", "run", "arxiv-mcp-server"],
                     ),
                     timeout=60.0,
                 )
             )
         ],
+        before_agent_callback=tracer.before_agent_callback,
+        after_agent_callback=tracer.after_agent_callback,
+        before_model_callback=tracer.before_model_callback,
+        after_model_callback=tracer.after_model_callback,
+        before_tool_callback=tracer.before_tool_callback,
+        after_tool_callback=tracer.after_tool_callback,
     )
     return agent
 
@@ -70,7 +109,11 @@ def create_runner():
     )
 
     # 👇 CREATE the session once (sync-friendly)
-    asyncio.run(session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID))
+    asyncio.run(
+        session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
+        )
+    )
 
     return runner
 
@@ -154,6 +197,44 @@ def _paper_key_from_markdown(paper_md: str) -> str:
     return f"paper_{digest[:16]}"
 
 
+def _parse_paper_block(paper_md: str) -> dict:
+    """Heuristic parse of a paper markdown block into a minimal dict.
+
+    Attempts to extract title, authors (list), abstract, pdf_url, entry_id (if present).
+    """
+    title = extract_title_from_markdown(paper_md)
+    authors: list[str] = []
+    abstract = ""
+    pdf_url = None
+    entry_id = None
+
+    # Simple heuristics
+    lines = [l.strip() for l in paper_md.splitlines()]
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if lower.startswith("authors:"):
+            authors_str = line.split(":", 1)[1].strip()
+            authors = [a.strip() for a in re.split(r",| and ", authors_str) if a.strip()]
+        elif lower.startswith("abstract:"):
+            abstract = line.split(":", 1)[1].strip()
+        elif "arxiv.org" in lower and "http" in lower:
+            # crude URL capture
+            m = re.search(r"https?://[^\s)]+", line)
+            if m:
+                pdf_url = m.group(0)
+        elif lower.startswith("id:") or lower.startswith("entry_id:"):
+            entry_id = line.split(":", 1)[1].strip()
+
+    return {
+        "title": title,
+        "authors": authors,
+        "abstract": abstract,
+        "pdf_url": pdf_url,
+        "entry_id": entry_id,
+        "raw": paper_md,
+    }
+
+
 def _render_assistant_response(markdown_text: str, namespace: str) -> None:
     """Render assistant markdown as paper boxes with like/dislike.
 
@@ -164,6 +245,7 @@ def _render_assistant_response(markdown_text: str, namespace: str) -> None:
         st.markdown(markdown_text)
         return
 
+    parsed_papers: list[dict] = []
     for idx, paper_md in enumerate(papers, start=1):
         with st.container(border=True):
             st.markdown(paper_md)
@@ -225,6 +307,13 @@ def _render_assistant_response(markdown_text: str, namespace: str) -> None:
                 fb = st.session_state.paper_feedback[key]
                 st.caption(f"Likes: {fb['likes']} • Dislikes: {fb['dislikes']}")
 
+        # Collect parsed paper info for potential reranking
+        parsed_papers.append(_parse_paper_block(paper_md))
+
+    # If rendering live results, store for rerank use
+    if namespace == "live":
+        st.session_state.last_papers = parsed_papers
+
 
 def save_feedback_to_file(path: str) -> tuple[bool, str]:
     """Save feedback as { title: { score } } with score in {1,0,-1}."""
@@ -277,7 +366,7 @@ st.title("📚 Research Assistant")
 st.markdown("*Powered by ADK + arXiv MCP*")
 
 # Initialize session state
-if 'messages' not in st.session_state:
+if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if 'paper_feedback' not in st.session_state:
@@ -287,7 +376,7 @@ if 'feedback_file' not in st.session_state:
     # default to a file next to this app
     st.session_state.feedback_file = os.path.join(os.path.dirname(__file__), "paper_feedback.json")
 
-if 'runner' not in st.session_state:
+if "runner" not in st.session_state:
     with st.spinner("Initializing research assistant..."):
         st.session_state.agent = create_agent()
         st.session_state.runner = create_runner()
@@ -301,6 +390,25 @@ for idx, message in enumerate(st.session_state.messages):
             _render_assistant_response(message["content"], namespace=f"hist_{idx}")
         else:
             st.markdown(message["content"])
+
+
+async def _run_turn_async(runner, user_id, session_id, content):
+    final_text_parts = []
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=content,
+    ):
+        # collect all text so we don't warn about non-text parts
+        if event.content and event.content.parts:
+            for p in event.content.parts:
+                if getattr(p, "text", None):
+                    final_text_parts.append(p.text)
+        if event.is_final_response():
+            break
+    txt = "".join(final_text_parts).strip()
+    return txt or "I couldn't produce a response this time."
+
 
 # Chat input
 if prompt := st.chat_input("What research topic would you like to explore?"):
@@ -317,16 +425,16 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
 
         with st.spinner("Searching arXiv..."):
             try:
-                # Prepare ADK content
                 content = types.Content(role="user", parts=[types.Part(text=prompt)])
-                final_text = None
-                for event in st.session_state.runner.run(
-                    user_id=st.session_state.user_id, session_id=st.session_state.session_id, new_message=content
-                ):
-                    if event.is_final_response():
-                        if event.content and event.content.parts:
-                            final_text = event.content.parts[0].text
-                        break
+                runner = get_asyncio_runner()
+                final_text = runner.run(
+                    _run_turn_async(
+                        st.session_state.runner,
+                        st.session_state.user_id,
+                        st.session_state.session_id,
+                        content,
+                    )
+                )
 
                 if not final_text:
                     final_text = "I couldn't produce a response this time."
@@ -337,12 +445,14 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
 
                 # Add assistant response to chat history (store original markdown)
                 st.session_state.messages.append({"role": "assistant", "content": final_text})
-
+                # Remember last query for persistent rerank controls
+                st.session_state.last_query = prompt
             except Exception as e:
                 error_msg = f"❌ Error: {str(e)}\n\nPlease try rephrasing your query or check that the arXiv MCP server is working correctly."
                 message_placeholder.markdown(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": error_msg}
+                )
 
 # Sidebar with example queries and info
 with st.sidebar:
