@@ -1,5 +1,7 @@
 # app.py
 import asyncio
+import re
+import hashlib
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -71,6 +73,74 @@ def create_runner():
     return runner
 
 
+# --- Helpers to render papers nicely in separate boxes ---
+def _split_markdown_into_papers(markdown_text: str) -> list[str]:
+    """Best-effort segmentation of assistant markdown into paper-sized chunks.
+
+    Heuristics:
+    - Split on blank lines that precede common paper starters: headings (###/##),
+      numbered items (1.), bullets (- or *), or explicit "Title:" markers.
+    - If nothing reasonable is found, return a single chunk.
+    """
+    if not markdown_text:
+        return []
+
+    text = markdown_text.strip()
+
+    # Try splitting where a new paper likely starts
+    chunks = re.split(r"\n\s*\n(?=\s*(?:#{2,3}\s|\d+\.\s|[-*]\s|Title:))", text)
+
+    # Post-filter: keep meaningful chunks
+    cleaned = [c.strip() for c in chunks if c and c.strip()]
+
+    # If the split was too aggressive or not helpful, fallback to a simpler rule:
+    if len(cleaned) <= 1:
+        alt = re.split(r"\n\s*\n\s*\n+", text)  # split on big paragraph gaps
+        alt_cleaned = [c.strip() for c in alt if c and c.strip()]
+        if len(alt_cleaned) > 1:
+            cleaned = alt_cleaned
+
+    # Final sanity: if still just one, return as single block
+    return cleaned if cleaned else [text]
+
+
+def _paper_key_from_markdown(paper_md: str) -> str:
+    """Generate a stable key for a paper based on content hash."""
+    digest = hashlib.sha256(paper_md.strip().encode("utf-8")).hexdigest()
+    return f"paper_{digest[:16]}"
+
+
+def _render_assistant_response(markdown_text: str, namespace: str) -> None:
+    """Render assistant markdown as paper boxes with like/dislike.
+
+    The namespace makes Streamlit widget keys stable and unique across messages.
+    """
+    papers = _split_markdown_into_papers(markdown_text)
+    if len(papers) <= 1:
+        st.markdown(markdown_text)
+        return
+
+    for idx, paper_md in enumerate(papers, start=1):
+        with st.container(border=True):
+            st.markdown(paper_md)
+
+            key_core = _paper_key_from_markdown(paper_md)
+            key = f"{namespace}_{key_core}"
+            if key not in st.session_state.paper_feedback:
+                st.session_state.paper_feedback[key] = {'likes': 0, 'dislikes': 0}
+
+            cols = st.columns([1, 1, 6])
+            with cols[0]:
+                if st.button("👍 Like", key=f"like_{key}"):
+                    st.session_state.paper_feedback[key]['likes'] += 1
+            with cols[1]:
+                if st.button("👎 Dislike", key=f"dislike_{key}"):
+                    st.session_state.paper_feedback[key]['dislikes'] += 1
+            with cols[2]:
+                fb = st.session_state.paper_feedback[key]
+                st.caption(f"Likes: {fb['likes']} • Dislikes: {fb['dislikes']}")
+
+
 # UI Header
 st.title("📚 Research Assistant")
 st.markdown("*Powered by ADK + arXiv MCP*")
@@ -78,6 +148,9 @@ st.markdown("*Powered by ADK + arXiv MCP*")
 # Initialize session state
 if 'messages' not in st.session_state:
     st.session_state.messages = []
+
+if 'paper_feedback' not in st.session_state:
+    st.session_state.paper_feedback = {}
 
 if 'runner' not in st.session_state:
     with st.spinner("Initializing research assistant..."):
@@ -87,9 +160,12 @@ if 'runner' not in st.session_state:
         st.session_state.session_id = SESSION_ID
 
 # Display chat history
-for message in st.session_state.messages:
+for idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        if message["role"] == "assistant":
+            _render_assistant_response(message["content"], namespace=f"hist_{idx}")
+        else:
+            st.markdown(message["content"])
 
 # Chat input
 if prompt := st.chat_input("What research topic would you like to explore?"):
@@ -120,10 +196,11 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
                 if not final_text:
                     final_text = "I couldn't produce a response this time."
 
-                # Display response
-                message_placeholder.markdown(final_text)
+                # Display response consistently using the same renderer as history
+                with message_placeholder.container():
+                    _render_assistant_response(final_text, namespace="live")
 
-                # Add assistant response to chat history
+                # Add assistant response to chat history (store original markdown)
                 st.session_state.messages.append({"role": "assistant", "content": final_text})
 
             except Exception as e:
@@ -174,6 +251,10 @@ with st.sidebar:
     if st.button("Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
+
+    if st.button("Reset Feedback Counts"):
+        st.session_state.paper_feedback = {}
+        st.experimental_rerun()
 
 # Footer
 st.markdown("---")
