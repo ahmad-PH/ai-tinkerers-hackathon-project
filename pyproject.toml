@@ -9,7 +9,9 @@ dependencies = [
     "google-adk>=1.15.1",
     "gradio>=5.47.2",
     "litellm>=1.77.5",
+    "opik>=1.8.59",
     "pyzotero>=1.6.16",
+    "streamlit>=1.50.0",
     "streamlit>=1.50.0",
 ]
 
