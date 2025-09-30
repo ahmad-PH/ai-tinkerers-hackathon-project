@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import List, Dict, Any
+import re
+from typing import List, Dict, Any, Set
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
@@ -38,6 +39,10 @@ class LiteratureReviewAgent:
         self.storage_path = storage_path or os.path.join(os.getcwd(), "papers")
         os.makedirs(self.storage_path, exist_ok=True)
         
+        # Track papers for citation generation
+        self.bibliography: Dict[str, Dict[str, Any]] = {}
+        self.citation_counter = 0
+        
         self.agent = self._create_agent()
         self.runner = self._create_runner()
         
@@ -66,12 +71,18 @@ When conducting a literature review:
 3. Download and read key papers if needed for deeper analysis
 4. Synthesize the findings into a comprehensive literature review
 
+**IMPORTANT CITATION TRACKING**:
+- When you mention any paper in your response, you MUST include a citation marker like [CITE:arxiv_id] where arxiv_id is the arXiv ID (e.g., [CITE:2301.12345])
+- For each paper you reference, include the citation marker immediately after the first mention
+- The system will automatically convert these markers to numbered citations [1], [2], etc.
+- Always include the arXiv ID in the citation marker - this is crucial for generating proper citations
+
 Always format your responses clearly with:
 - Paper titles and authors
 - Publication dates
 - Key findings and contributions
 - Relevance to the user's query
-- Links to arXiv papers
+- Citation markers for each paper mentioned
 
 Be thorough but concise. Focus on the most relevant and recent papers.
 """
@@ -121,6 +132,52 @@ Be thorough but concise. Focus on the most relevant and recent papers.
         
         return runner
     
+    def _extract_citations_from_response(self, response: str) -> str:
+        """
+        Extract citation markers from the response and replace them with numbered citations.
+        Also populate the bibliography with paper information.
+        """
+        # Pattern to match [CITE:arxiv_id] markers
+        cite_pattern = r'\[CITE:([^\]]+)\]'
+        
+        def replace_citation(match):
+            arxiv_id = match.group(1)
+            
+            # If this paper hasn't been cited yet, add it to bibliography
+            if arxiv_id not in self.bibliography:
+                self.citation_counter += 1
+                self.bibliography[arxiv_id] = {
+                    'citation_number': self.citation_counter,
+                    'arxiv_id': arxiv_id,
+                    'url': f"https://arxiv.org/abs/{arxiv_id}"
+                }
+            
+            citation_number = self.bibliography[arxiv_id]['citation_number']
+            return f"[{citation_number}]"
+        
+        # Replace all citation markers with numbered citations
+        processed_response = re.sub(cite_pattern, replace_citation, response)
+        return processed_response
+    
+    def _generate_bibliography(self) -> str:
+        """Generate a formatted bibliography section."""
+        if not self.bibliography:
+            return ""
+        
+        bibliography_lines = ["\n## References"]
+        
+        # Sort by citation number
+        sorted_papers = sorted(self.bibliography.values(), key=lambda x: x['citation_number'])
+        
+        for paper in sorted_papers:
+            citation_number = paper['citation_number']
+            arxiv_id = paper['arxiv_id']
+            url = paper['url']
+            
+            bibliography_lines.append(f"[{citation_number}] https://arxiv.org/abs/{arxiv_id}")
+        
+        return "\n".join(bibliography_lines)
+    
     async def _run_query_async(self, query: str) -> str:
         """Run a query asynchronously and return the response."""
         try:
@@ -142,7 +199,13 @@ Be thorough but concise. Focus on the most relevant and recent papers.
                 if event.is_final_response():
                     break
             
-            return "".join(final_text_parts).strip()
+            raw_response = "".join(final_text_parts).strip()
+            
+            # Process citations and return formatted response
+            processed_response = self._extract_citations_from_response(raw_response)
+            bibliography = self._generate_bibliography()
+            
+            return processed_response + bibliography
             
         except Exception as e:
             logger.error(f"Error running query: {e}")
@@ -159,6 +222,10 @@ Be thorough but concise. Focus on the most relevant and recent papers.
             A formatted literature review with relevant papers and analysis
         """
         logger.info(f"Starting literature review for query: {query}")
+        
+        # Reset bibliography for each new query
+        self.bibliography.clear()
+        self.citation_counter = 0
         
         # Run the async query
         runner = asyncio.Runner()
