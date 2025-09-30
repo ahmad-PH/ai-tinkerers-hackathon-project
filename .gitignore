@@ -49,6 +49,9 @@ coverage.xml
 
 # Jupyter Notebook
 .ipynb_checkpoints
+.profile_default/
+*.nbconvert.ipynb
+
 
 # pyenv
 .python-version
@@ -87,11 +90,16 @@ venv.bak/
 # mkdocs documentation
 /site
 
-# mypy
-.mypy_cache/
-
 # IDEs
 .idea/
 .vscode/
 *.sublime-project
 *.sublime-workspace
+
+# Runtime
+.DS_Store
+
+# Credentials
+secrets.*
+*.key
+*.pem
