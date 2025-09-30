@@ -11,6 +11,7 @@ dependencies = [
     "gradio>=5.47.2",
     "litellm>=1.77.5",
     "numpy>=1.24.0",
+    "opik>=1.8.59",
     "pyzotero>=1.6.16",
     "python-dotenv>=1.0.0",
     "streamlit>=1.50.0",
