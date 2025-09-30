@@ -5,6 +5,7 @@ description = "Research Assistant: AI Tinkerers x Google Cloud Hackathon Project
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "datasets>=4.1.1",
     "google-adk>=1.15.1",
     "gradio>=5.47.2",
     "pyzotero>=1.6.16",
