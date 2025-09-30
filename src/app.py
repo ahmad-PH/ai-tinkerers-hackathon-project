@@ -300,6 +300,12 @@ def _render_assistant_response(markdown_text: str, namespace: str) -> None:
 
     The namespace makes Streamlit widget keys stable and unique across messages.
     """
+    # If this is an explicit reranking summary, render plainly without feedback controls
+    first_non_empty = next((l for l in markdown_text.splitlines() if l.strip()), "").strip()
+    if first_non_empty.lower().startswith("### reranked papers"):
+        st.markdown(markdown_text)
+        return
+
     papers = _split_markdown_into_papers(markdown_text)
     if len(papers) <= 1:
         st.markdown(markdown_text)
