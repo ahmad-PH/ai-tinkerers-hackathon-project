@@ -27,5 +27,5 @@ class Paper:
             "entry_id": self.entry_id,
         }
 
-def rerank(query: str, papers: List[str], user_feedbacks=List[bool]):
+def rerank(query: str, papers: List[str], user_feedbacks=Optional[List[bool]]):
     return papers
