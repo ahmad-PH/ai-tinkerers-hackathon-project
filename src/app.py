@@ -2,6 +2,8 @@
 import asyncio
 import re
 import hashlib
+import json
+import os
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -104,6 +106,48 @@ def _split_markdown_into_papers(markdown_text: str) -> list[str]:
     return cleaned if cleaned else [text]
 
 
+def extract_title_from_markdown(paper_md: str) -> str:
+    """Extract a likely title from a paper markdown block.
+
+    Priority:
+    - First heading line starting with ### or ##
+    - Line starting with Title:
+    - First non-empty line (trimmed)
+    """
+    lines = [l.strip() for l in paper_md.splitlines() if l.strip()]
+    for l in lines:
+        if l.startswith("### ") or l.startswith("## "):
+            return normalize_title(l.lstrip('#').strip())
+    for l in lines:
+        if l.lower().startswith("title:"):
+            return normalize_title(l.split(":", 1)[1].strip() or "Untitled")
+    return normalize_title(lines[0]) if lines else "Untitled"
+
+
+def normalize_title(raw: str) -> str:
+    """Remove markdown syntax and ordering from a title-like string.
+
+    - Strip link markup: [text](url) -> text
+    - Remove leading heading hashes, list markers, and numeric prefixes (e.g., "1. ")
+    - Remove common emphasis/backtick wrappers and collapse whitespace
+    """
+    if not raw:
+        return "Untitled"
+
+    s = raw.strip()
+    # Remove link markdown
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\\1", s)
+    # Remove heading markers (if any remain)
+    s = s.lstrip('#').strip()
+    # Remove list/numeric prefixes like "1. ", "- ", "* ", "+ "
+    s = re.sub(r"^(?:\d+\.\s+|[-*+]\s+)", "", s)
+    # Strip surrounding emphasis/backticks
+    s = s.strip("*_` ")
+    # Collapse internal whitespace
+    s = re.sub(r"\s+", " ", s)
+    return s or "Untitled"
+
+
 def _paper_key_from_markdown(paper_md: str) -> str:
     """Generate a stable key for a paper based on content hash."""
     digest = hashlib.sha256(paper_md.strip().encode("utf-8")).hexdigest()
@@ -127,18 +171,105 @@ def _render_assistant_response(markdown_text: str, namespace: str) -> None:
             key_core = _paper_key_from_markdown(paper_md)
             key = f"{namespace}_{key_core}"
             if key not in st.session_state.paper_feedback:
-                st.session_state.paper_feedback[key] = {'likes': 0, 'dislikes': 0}
+                # Extract a human-friendly title for export purposes
+                title = extract_title_from_markdown(paper_md)
+                # Initialize entry
+                st.session_state.paper_feedback[key] = {
+                    'likes': 0,
+                    'dislikes': 0,
+                    'vote': None,
+                    'title': title,
+                }
+                # If we have a loaded score for this title, apply it once
+                if 'title_scores' in st.session_state and title in st.session_state.title_scores:
+                    score = st.session_state.title_scores[title]
+                    if score == 1:
+                        st.session_state.paper_feedback[key]['likes'] = 1
+                        st.session_state.paper_feedback[key]['dislikes'] = 0
+                        st.session_state.paper_feedback[key]['vote'] = 'like'
+                    elif score == -1:
+                        st.session_state.paper_feedback[key]['likes'] = 0
+                        st.session_state.paper_feedback[key]['dislikes'] = 1
+                        st.session_state.paper_feedback[key]['vote'] = 'dislike'
+                    else:
+                        st.session_state.paper_feedback[key]['likes'] = 0
+                        st.session_state.paper_feedback[key]['dislikes'] = 0
+                        st.session_state.paper_feedback[key]['vote'] = None
 
             cols = st.columns([1, 1, 6])
             with cols[0]:
-                if st.button("👍 Like", key=f"like_{key}"):
-                    st.session_state.paper_feedback[key]['likes'] += 1
+                current_vote = st.session_state.paper_feedback[key].get('vote')
+                like_disabled = current_vote == 'like'
+                if st.button("👍 Like", key=f"like_{key}", disabled=like_disabled):
+                    # Only count if switching from no vote or from dislike
+                    if current_vote == 'dislike':
+                        st.session_state.paper_feedback[key]['dislikes'] = max(
+                            0, st.session_state.paper_feedback[key]['dislikes'] - 1
+                        )
+                    if current_vote != 'like':
+                        st.session_state.paper_feedback[key]['likes'] += 1
+                        st.session_state.paper_feedback[key]['vote'] = 'like'
             with cols[1]:
-                if st.button("👎 Dislike", key=f"dislike_{key}"):
-                    st.session_state.paper_feedback[key]['dislikes'] += 1
+                current_vote = st.session_state.paper_feedback[key].get('vote')
+                dislike_disabled = current_vote == 'dislike'
+                if st.button("👎 Dislike", key=f"dislike_{key}", disabled=dislike_disabled):
+                    # Only count if switching from no vote or from like
+                    if current_vote == 'like':
+                        st.session_state.paper_feedback[key]['likes'] = max(
+                            0, st.session_state.paper_feedback[key]['likes'] - 1
+                        )
+                    if current_vote != 'dislike':
+                        st.session_state.paper_feedback[key]['dislikes'] += 1
+                        st.session_state.paper_feedback[key]['vote'] = 'dislike'
             with cols[2]:
                 fb = st.session_state.paper_feedback[key]
                 st.caption(f"Likes: {fb['likes']} • Dislikes: {fb['dislikes']}")
+
+
+def save_feedback_to_file(path: str) -> tuple[bool, str]:
+    """Save feedback as { title: { score } } with score in {1,0,-1}."""
+    try:
+        export: dict[str, dict] = {}
+        for entry in st.session_state.paper_feedback.values():
+            title = normalize_title(entry.get('title') or 'Untitled')
+            vote = entry.get('vote')
+            if vote == 'like':
+                score = 1
+            elif vote == 'dislike':
+                score = -1
+            else:
+                score = 0
+            export[title] = {"score": score}
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(export, f, ensure_ascii=False, indent=2)
+        return True, f"Saved feedback to {path}"
+    except Exception as e:
+        return False, str(e)
+
+
+def load_feedback_from_file(path: str) -> tuple[bool, str]:
+    """Load { title: { score } }, store in session as title->score for later binding."""
+    try:
+        if not os.path.exists(path):
+            return False, "File does not exist"
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return False, "Invalid file format"
+
+            # Convert into a simpler mapping: title -> score
+            title_scores: dict[str, int] = {}
+            for title, obj in data.items():
+                title = normalize_title(title)
+                if isinstance(obj, dict) and "score" in obj:
+                    score = obj["score"]
+                    if score in (-1, 0, 1):
+                        title_scores[title] = score
+            st.session_state.title_scores = title_scores
+        return True, f"Loaded feedback from {path}"
+    except Exception as e:
+        return False, str(e)
 
 
 # UI Header
@@ -151,6 +282,10 @@ if 'messages' not in st.session_state:
 
 if 'paper_feedback' not in st.session_state:
     st.session_state.paper_feedback = {}
+
+if 'feedback_file' not in st.session_state:
+    # default to a file next to this app
+    st.session_state.feedback_file = os.path.join(os.path.dirname(__file__), "paper_feedback.json")
 
 if 'runner' not in st.session_state:
     with st.spinner("Initializing research assistant..."):
@@ -255,6 +390,26 @@ with st.sidebar:
     if st.button("Reset Feedback Counts"):
         st.session_state.paper_feedback = {}
         st.experimental_rerun()
+
+    st.markdown("---")
+    st.markdown("### Save/Load Feedback")
+    st.session_state.feedback_file = st.text_input("Feedback file path", st.session_state.feedback_file)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("💾 Save Feedback"):
+            ok, msg = save_feedback_to_file(st.session_state.feedback_file)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+    with col_b:
+        if st.button("📂 Load Feedback"):
+            ok, msg = load_feedback_from_file(st.session_state.feedback_file)
+            if ok:
+                st.success(msg)
+                st.experimental_rerun()
+            else:
+                st.error(msg)
 
 # Footer
 st.markdown("---")
