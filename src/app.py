@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from time import sleep
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -90,6 +91,129 @@ def list_zotero_collections() -> list[tuple[str, str]]:
 
 
 # ---- Zotero export helpers ---------------------------------------------------
+def _paper_to_zotero_item(p: Paper, collection_key: str | None = None) -> dict:
+    """Map our Paper -> Zotero 'journalArticle' (or 'preprint' if no year/venue)."""
+    # Authors to Zotero creator schema
+    creators = []
+    for a in p.authors or []:
+        # naive split "Last, First" or "First Last"
+        if "," in a:
+            last, first = [s.strip() for s in a.split(",", 1)]
+        else:
+            parts = a.split()
+            first = " ".join(parts[:-1]).strip() if len(parts) > 1 else ""
+            last = parts[-1] if parts else ""
+        creators.append({"creatorType": "author", "firstName": first, "lastName": last})
+
+    item = {
+        "itemType": "journalArticle",  # most arXiv works later get proper metadata
+        "title": p.title or "",
+        "abstractNote": p.abstract or "",
+        "creators": creators,
+        "date": str(p.year) if isinstance(p.year, int) and p.year > 0 else "",
+        "DOI": (p.doi or "").strip(),
+        "url": p.url or "",
+        "libraryCatalog": "ADK Research Assistant",
+        "tags": [{"tag": "adk-import"}],
+    }
+    # If no DOI/year, tag as preprint-like for clarity
+    if not item["DOI"] and not item["date"]:
+        item["extra"] = "arXiv import (metadata incomplete)"
+    if collection_key:
+        item["collections"] = [collection_key]
+    return item
+
+
+def _find_existing_item(z, p: Paper):
+    """Try to find an existing Zotero item by DOI (best) or title+year (fallback)."""
+    try:
+        if p.doi:
+            # DOI search (works well)
+            found = z.items(q=p.doi, qmode="everything", itemType="-attachment")
+            if found:
+                return found[0]
+        # Fallback: title (quoted) and year filter
+        query = f'"{p.title}"' if p.title else ""
+        if query:
+            found = z.items(q=query, qmode="titleCreatorYear", itemType="-attachment")
+            if found and isinstance(p.year, int) and p.year > 0:
+                for it in found:
+                    data = it.get("data", {})
+                    if (data.get("date", "") or "").startswith(str(p.year)):
+                        return it
+            elif found:
+                return found[0]
+    except Exception:
+        pass
+    return None
+
+
+def export_to_zotero(papers: list[Paper], collection_key: str | None = None, dry_run: bool = False) -> dict:
+    """
+    Create (or skip existing) items in Zotero using pyzotero.
+    Returns {created:[], skipped:[], failed:[(paper, error_str)]}
+    """
+    res = {"created": [], "skipped": [], "failed": []}
+    z = get_zotero_client()
+    if not z:
+        raise RuntimeError("Zotero client not available. Check ZOTERO_USER_ID, ZOTERO_API_KEY, and pyzotero install.")
+
+    # Prepare items with de-duplication check
+    to_create = []
+    for p in papers:
+        existing = _find_existing_item(z, p)
+        if existing:
+            res["skipped"].append({"title": p.title, "reason": "exists", "key": existing.get("key")})
+            continue
+        item = _paper_to_zotero_item(p, collection_key=collection_key or None)
+        to_create.append(item)
+
+    if dry_run or not to_create:
+        return res
+
+    # Create in small batches with retry for server hiccups
+    BATCH = 10
+    for i in range(0, len(to_create), BATCH):
+        batch = to_create[i : i + BATCH]
+        # two tries per batch
+        for attempt in (1, 2):
+            try:
+                created = z.create_items(batch)
+                # pyzotero returns a dict keyed by successful keys or a list; normalize
+                if isinstance(created, dict):
+                    # successes are under 'successful'
+                    for k, v in (created.get("successful") or {}).items():
+                        res["created"].append({"key": k, "title": v.get("data", {}).get("title", "")})
+                    # show failures per-item if any
+                    for k, v in (created.get("failed") or {}).items():
+                        title = v.get("data", {}).get("title", "")
+                        err = v.get("error", "unknown error")
+                        res["failed"].append((title, f"create failed: {err}"))
+                else:
+                    # fallback if API returns list
+                    for v in created or []:
+                        res["created"].append({"key": v.get("key"), "title": v.get("data", {}).get("title", "")})
+                break  # batch ok
+            except Exception:
+                if attempt == 1:
+                    sleep(0.8)  # brief backoff and retry once
+                else:
+                    # On persistent 5xx: fall back to per-item create to salvage what we can
+                    for it in batch:
+                        try:
+                            v = z.create_items([it])
+                            if isinstance(v, dict) and v.get("successful"):
+                                for k2, v2 in v["successful"].items():
+                                    res["created"].append({"key": k2, "title": v2.get("data", {}).get("title", "")})
+                            elif isinstance(v, list) and v:
+                                res["created"].append(
+                                    {"key": v[0].get("key"), "title": v[0].get("data", {}).get("title", "")}
+                                )
+                            else:
+                                res["failed"].append((it.get("title", ""), "unknown create response"))
+                        except Exception as ei:
+                            res["failed"].append((it.get("title", ""), str(ei)))
+    return res
 
 
 def _split_author(name: str) -> dict:
@@ -106,66 +230,6 @@ def _split_author(name: str) -> dict:
     if len(parts) == 1:
         return {"creatorType": "author", "firstName": "", "lastName": parts[0]}
     return {"creatorType": "author", "firstName": " ".join(parts[:-1]), "lastName": parts[-1]}
-
-
-def export_papers_to_zotero(
-    papers: list[Paper], collection_key: str | None = None, add_tag: str = "ADK Imported"
-) -> tuple[int, list[str]]:
-    """
-    Export Paper -> Zotero items via pyzotero. Returns (created_count, error_messages).
-    """
-    z = get_zotero_client()
-    if not z:
-        return (0, ["Zotero client not available: pyzotero not installed or env vars missing."])
-
-    items_payload = []
-    for p in papers:
-        creators = [_split_author(a) for a in (p.authors or [])]
-        # Minimal Zotero item; default to 'journalArticle'. Use 'preprint' if arXiv id obvious.
-        item_type = (
-            "preprint"
-            if (p.id or "").lower().startswith(("arxiv", "arxiv:", "http", "240", "23"))
-            else "journalArticle"
-        )
-        date_str = str(p.year) if isinstance(p.year, int) and p.year > 0 else ""
-
-        item = {
-            "itemType": item_type,
-            "title": p.title or "(untitled)",
-            "creators": creators,
-            "abstractNote": p.abstract or "",
-            "date": date_str,
-            "DOI": p.doi or "",
-            "url": p.url or "",
-            "language": "",
-            "libraryCatalog": "arXiv" if (p.source or "").lower() == "arxiv" else "",
-            "accessDate": "",
-            "tags": [{"tag": add_tag}],
-            "collections": [{"key": collection_key}] if collection_key else [],
-            "extra": (f"arXiv:{p.id}" if (p.id and "arxiv" in (p.source or "").lower()) else ""),
-        }
-        items_payload.append(item)
-
-    created = 0
-    errors: list[str] = []
-    # pyzotero accepts a list to create multiple items
-    try:
-        # Batch create in chunks of 25 to be safe
-        for i in range(0, len(items_payload), 25):
-            chunk = items_payload[i : i + 25]
-            resp = z.create_items(chunk)
-            # pyzotero returns a dict with 'successful' and 'failed'
-            succ = (resp or {}).get("successful", {})
-            fail = (resp or {}).get("failed", {})
-            created += len(succ)
-            if fail:
-                for _, f in fail.items():
-                    msg = (f or {}).get("message") or "Unknown error"
-                    errors.append(str(msg))
-    except Exception as e:
-        errors.append(f"Create failed: {e}")
-
-    return (created, errors)
 
 
 def mcp_toolset(command: str, args: list[str], env: dict | None = None, timeout: float = 60.0):
@@ -906,29 +970,21 @@ def _get_selected_for_synthesis(top_k_default: int = None) -> list[Paper]:
 if st.session_state.get("last_ranked_papers") and st.session_state.get("show_synthesis_buttons", False):
     with st.container():
         c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+
         with c1:
             if st.button("🔀 Rerank with feedback", key="btn_rerank_after"):
-                # 1) Build feedback vector (NO reruns in this loop)
                 feedback_vec = []
                 for p in st.session_state.last_ranked_papers:
-                    k = _paper_key(p.title, p.url)  # keep this consistent with render_cards
+                    k = _paper_key(p.title, p.url)
                     vote = st.session_state.paper_feedback.get(k, {}).get("vote")
-                    score = 1 if vote == "like" else (-1 if vote == "dislike" else 0)
-                    feedback_vec.append(score)
+                    feedback_vec.append(1 if vote == "like" else (-1 if vote == "dislike" else 0))
 
-                # 2) Get the most recent user query
-                user_query = ""
-                for m in reversed(st.session_state.messages):
-                    if m["role"] == "user":
-                        user_query = m["content"]
-                        break
-
-                # 3) Rerank (handle both Paper and dict inputs)
+                user_query = next(
+                    (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"), ""
+                )
                 try:
                     new_rank = rerank(
-                        query=user_query,
-                        papers=st.session_state.last_ranked_papers,
-                        user_feedbacks=feedback_vec,
+                        query=user_query, papers=st.session_state.last_ranked_papers, user_feedbacks=feedback_vec
                     )
                 except Exception:
                     new_rank = rerank(
@@ -938,20 +994,16 @@ if st.session_state.get("last_ranked_papers") and st.session_state.get("show_syn
                     )
                     new_rank = [Paper(**(p if isinstance(p, dict) else p.__dict__)) for p in new_rank]
 
-                # 4) Render and persist
                 with st.chat_message("assistant"):
                     st.markdown("### Reranked (with feedback)")
-                    render_cards(new_rank, namespace=f"reranked_{len(st.session_state.messages)}")
-
+                    render_cards(new_rank, namespace="reranked")
                 st.session_state.messages.append(
                     {"role": "assistant", "content": {"papers": [p.model_dump() for p in new_rank]}}
                 )
                 st.session_state.last_ranked_papers = new_rank
                 st.session_state.show_synthesis_buttons = True
-                st.session_state.did_rerank = True
-
-                # 5) Now refresh once (AFTER state updates)
                 st.rerun()
+
         with c2:
             if st.button("🧭 Generate Gap Analysis", key="btn_gap_after"):
                 selected = _get_selected_for_synthesis()
@@ -1007,23 +1059,33 @@ if st.session_state.get("last_ranked_papers") and st.session_state.get("show_syn
                             st.session_state.messages.append(
                                 {"role": "assistant", "content": review_md or "_No output_"}
                             )
+
+        # NEW: Export to Zotero
         with c4:
-            if st.session_state.get("did_rerank", False):  # only show after rerank
-                if st.button("📥 Export to Zotero", key="btn_export_zotero"):
+            if st.button("📥 Export liked → Zotero", key="btn_export_zotero"):
+                if not HAVE_PYZOTERO or not zotero_env_ok():
+                    st.error("Zotero export unavailable. Install `pyzotero` and set ZOTERO_USER_ID / ZOTERO_API_KEY.")
+                else:
                     selected = _get_selected_for_synthesis()
                     if not selected:
-                        st.warning("No papers to export.")
+                        st.warning("No papers selected to export.")
                     else:
-                        # Optional: honor sidebar selection if present
-                        target_collection = selected_collection_key or ""
-                        created, errors = export_papers_to_zotero(selected, collection_key=target_collection)
-                        if created:
-                            st.success(
-                                f"Exported {created} paper(s) to Zotero"
-                                + (f" in collection {selected_collection_name}" if target_collection else "")
+                        try:
+                            result = export_to_zotero(
+                                papers=selected, collection_key=(selected_collection_key or None)
                             )
-                        if errors:
-                            st.error("Some items failed to export:\n- " + "\n- ".join(errors))
+                            created_n = len(result["created"])
+                            skipped_n = len(result["skipped"])
+                            failed_n = len(result["failed"])
+                            st.success(
+                                f"Zotero export complete — created: {created_n}, skipped (existing): {skipped_n}, failed: {failed_n}"
+                            )
+                            if failed_n:
+                                with st.expander("Show export failures"):
+                                    for title, err in result["failed"]:
+                                        st.write(f"• **{title}** — {err}")
+                        except Exception as e:
+                            st.error(f"Export failed: {e}")
 
 
 # -----------------------------------------------------------------------------
