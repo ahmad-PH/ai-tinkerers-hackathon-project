@@ -2,11 +2,21 @@ from typing import List, Optional
 from dataclasses import dataclass
 import numpy as np
 import os
+import json
+import hashlib
 from dotenv import load_dotenv
 from google import genai
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Cache configuration
+CACHE_FILE = "embedding_cache.json"
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "cache")
+CACHE_PATH = os.path.join(CACHE_DIR, CACHE_FILE)
+
+# Ensure cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 @dataclass
 class Paper:
@@ -46,8 +56,48 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return dot_product / (norm_a * norm_b)
 
 
+def _get_text_hash(text: str) -> str:
+    """Generate a hash for the text to use as cache key."""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
+def _load_cache() -> dict:
+    """Load the embedding cache from JSON file."""
+    try:
+        if os.path.exists(CACHE_PATH):
+            with open(CACHE_PATH, 'r') as f:
+                return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Could not load cache file: {e}")
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    """Save the embedding cache to JSON file."""
+    try:
+        with open(CACHE_PATH, 'w') as f:
+            json.dump(cache, f, indent=2)
+    except IOError as e:
+        print(f"Warning: Could not save cache file: {e}")
+
+
 def get_embedding(text: str) -> np.ndarray:
-    """Get embedding for a text using Gemini embedding model."""
+    """Get embedding for a text using Gemini embedding model with local caching."""
+    # Generate hash for the text
+    text_hash = _get_text_hash(text)
+    
+    # Load cache
+    cache = _load_cache()
+    
+    # Check if embedding exists in cache
+    if text_hash in cache:
+        # print(f"✅ CACHE HIT: Found embedding for text hash {text_hash[:8]}... (text preview: '{text[:50]}{'...' if len(text) > 50 else ''}')")
+        return np.array(cache[text_hash])
+    
+    # Get embedding from API
+    print(f"❌ CACHE MISS: No embedding found for text hash {text_hash[:8]}... (text preview: '{text[:50]}{'...' if len(text) > 50 else ''}')")
+    print(f"🔄 Fetching from Gemini API...")
+    
     try:
         # Get API key from environment
         api_key = os.getenv("GEMINI_API_KEY")
@@ -63,12 +113,51 @@ def get_embedding(text: str) -> np.ndarray:
         
         # Extract embedding vector
         embedding_vector = response.embeddings[0].values
-        return np.array(embedding_vector)
+        embedding_array = np.array(embedding_vector)
+        
+        # Cache the embedding
+        cache[text_hash] = embedding_vector
+        _save_cache(cache)
+        print(f"💾 CACHED: Saved new embedding for text hash {text_hash[:8]}... (embedding dim: {len(embedding_vector)})")
+        
+        return embedding_array
         
     except Exception as e:
-        print(f"Error getting embedding: {e}")
+        print(f"❌ ERROR: Failed to get embedding: {e}")
         # Return a zero vector as fallback
         return np.zeros(768)  # Gemini text-embedding-004 has 768 dimensions
+
+
+def clear_embedding_cache() -> None:
+    """Clear the embedding cache."""
+    try:
+        if os.path.exists(CACHE_PATH):
+            os.remove(CACHE_PATH)
+            print("Embedding cache cleared.")
+        else:
+            print("No cache file found to clear.")
+    except IOError as e:
+        print(f"Error clearing cache: {e}")
+
+
+def get_cache_stats() -> dict:
+    """Get statistics about the embedding cache."""
+    cache = _load_cache()
+    cache_size = os.path.getsize(CACHE_PATH) if os.path.exists(CACHE_PATH) else 0
+    
+    print(f"📊 CACHE STATISTICS:")
+    print(f"   • Cached embeddings: {len(cache)}")
+    print(f"   • Cache file size: {cache_size:,} bytes ({cache_size/1024:.1f} KB)")
+    print(f"   • Cache file path: {CACHE_PATH}")
+    
+    if cache:
+        print(f"   • Sample cached hashes: {list(cache.keys())[:3]}")
+    
+    return {
+        "cached_embeddings": len(cache),
+        "cache_file_size": cache_size,
+        "cache_file_path": CACHE_PATH
+    }
 
 
 def rerank(query: str, papers: List[Paper], user_feedbacks: Optional[List[bool]] = None) -> List[Paper]:
