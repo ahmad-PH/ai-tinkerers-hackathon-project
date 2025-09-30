@@ -18,6 +18,11 @@ CACHE_PATH = os.path.join(CACHE_DIR, CACHE_FILE)
 # Ensure cache directory exists
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# User feedback tuning parameters
+LINEAR_POSITIVE_MULTIPLIER: float = 1.3  # Multiply similarity by this for +1 feedback
+LINEAR_NEGATIVE_MULTIPLIER: float = 0.7   # Multiply similarity by this for -1 feedback
+LINEAR_NEUTRAL_MULTIPLIER: float = 1.0   # Multiply similarity by this for 0 feedback
+
 @dataclass
 class Paper:
     """Represents a paper from a search API (e.g., arXiv)."""
@@ -160,14 +165,27 @@ def get_cache_stats() -> dict:
     }
 
 
-def rerank(query: str, papers: List[Paper], user_feedbacks: Optional[List[bool]] = None) -> List[Paper]:
+def _apply_linear_feedback(similarity: float, feedback: float) -> float:
+    """Apply linear scaling based on user feedback."""
+    if feedback > 0:
+        multiplier = LINEAR_POSITIVE_MULTIPLIER
+    elif feedback < 0:
+        multiplier = LINEAR_NEGATIVE_MULTIPLIER
+    else:
+        multiplier = LINEAR_NEUTRAL_MULTIPLIER
+    
+    return similarity * multiplier
+
+
+def rerank(query: str, papers: List[Paper], user_feedbacks: Optional[List[float]] = None) -> List[Paper]:
     """
-    Rerank papers based on query relevance using Gemini embeddings and cosine similarity.
+    Rerank papers based on query relevance using Gemini embeddings and cosine similarity,
+    with optional user feedback integration using linear scaling.
     
     Args:
         query: User search query
         papers: List of Paper objects to rerank
-        user_feedbacks: Optional list of boolean feedback (not used in current implementation)
+        user_feedbacks: Optional list of float feedback values (-1, 0, or +1)
     
     Returns:
         List of Paper objects sorted by relevance to the query
@@ -175,21 +193,43 @@ def rerank(query: str, papers: List[Paper], user_feedbacks: Optional[List[bool]]
     if not papers:
         return papers
     
+    # Validate user_feedbacks if provided
+    if user_feedbacks is not None:
+        if len(user_feedbacks) != len(papers):
+            raise ValueError(f"user_feedbacks length ({len(user_feedbacks)}) must match papers length ({len(papers)})")
+        
+        # Validate feedback values
+        for i, feedback in enumerate(user_feedbacks):
+            if not isinstance(feedback, (int, float)) or feedback not in [-1, 0, 1]:
+                raise ValueError(f"user_feedbacks[{i}] must be -1, 0, or 1, got {feedback}")
+    
     # Get embedding for the query
     query_embedding = get_embedding(query)
     
     # Calculate similarities and create paper-score pairs
     paper_scores = []
-    for paper in papers:
+    for i, paper in enumerate(papers):
         # Combine title and abstract for better context
         paper_text = f"{paper.title}. {paper.abstract}"
         paper_embedding = get_embedding(paper_text)
         
         similarity = cosine_similarity(query_embedding, paper_embedding)
-        paper_scores.append((paper, similarity))
+        
+        # Apply user feedback if provided
+        if user_feedbacks is not None:
+            feedback = user_feedbacks[i]
+            adjusted_similarity = _apply_linear_feedback(similarity, feedback)
+        else:
+            adjusted_similarity = similarity
+        
+        paper_scores.append((paper, adjusted_similarity))
     
-    # Sort papers by similarity score (descending)
+    # Sort papers by adjusted similarity score (descending)
     paper_scores.sort(key=lambda x: x[1], reverse=True)
+
+    print("Papers and their adjusted scores, each on new line: ")
+    for paper, score in paper_scores:
+        print(f"{paper}, {score}")
 
     # Return papers in order of relevance
     return [paper for paper, score in paper_scores]

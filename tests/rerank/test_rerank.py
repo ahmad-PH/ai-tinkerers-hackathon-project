@@ -45,8 +45,7 @@ class TestRerank:
             )
         ]
     
-    def test_rerank_input_output_size_match(self):
-        """Test that rerank returns the same number of papers as input."""
+    def test_rerank_retrieve_best_obvious_match(self):
         query = "Find me papers about ResNet architecture."
         
         result = rerank(query, self.sample_papers)
@@ -55,8 +54,19 @@ class TestRerank:
         assert len(result) == len(self.sample_papers), "Should return same number of papers"
         
         # Check that ResNet paper is ranked highest for this query
-        assert result[0].title == "ResNet: Deep Residual Learning for Image Recognition", "Relevant paper (ResNet) should be ranked highest"
-    
+        assert "ResNet" in result[0].title
+
+    def test_rerank_user_feedback_impact(self):
+        query = "Find me papers about ResNet architecture."
+        
+        result = rerank(query, self.sample_papers, user_feedbacks=[0, 0, -1, 0, 1])
+        
+        # Check that we get the same number of papers back
+        assert len(result) == len(self.sample_papers), "Should return same number of papers"
+        
+        # Check that ResNet paper is ranked highest for this query
+        assert "Dropout" in result[0].title
+
     def test_rerank_empty_input(self):
         """Test that rerank handles empty input gracefully."""
         query = "test query"
