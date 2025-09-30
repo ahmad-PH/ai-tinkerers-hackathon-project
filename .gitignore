@@ -103,3 +103,6 @@ venv.bak/
 secrets.*
 *.key
 *.pem
+
+# Project-specific cache files
+src/cache/
