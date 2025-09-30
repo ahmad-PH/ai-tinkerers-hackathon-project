@@ -7,7 +7,7 @@ from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.genai import types
 from mcp import StdioServerParameters
 
@@ -26,7 +26,7 @@ st.set_page_config(page_title="Research Assistant", page_icon="📚", layout="wi
 def create_agent():
     """Create the ADK agent with arXiv MCP toolset"""
     agent = LlmAgent(
-        model='gemini-2.0-flash-exp',
+        model='gemini-2.5-flash-lite',
         name='research_assistant',
         instruction="""You are a research assistant that helps users find academic papers.
 
@@ -39,20 +39,18 @@ When the user provides a research topic or question:
 
 Format your responses as markdown for better readability.""",
         tools=[
-            MCPToolset(
+            McpToolset(
                 connection_params=StdioConnectionParams(
                     server_params=StdioServerParameters(
-                        command='uvx',
-                        args=["arxiv-mcp-server"],
-                    )
+                        command='uv',
+                        args=['tool', 'run', 'arxiv-mcp-server'],
+                    ),
+                    timeout=60.0,
                 )
             )
         ],
     )
     return agent
-
-
-# --- replace your create_runner and init block with this ---
 
 
 @st.cache_resource
