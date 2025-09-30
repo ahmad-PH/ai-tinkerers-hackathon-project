@@ -9,7 +9,7 @@ import os
 # Add the src directory to the path so we can import our modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-from literature_review.literature_review import literature_review
+from src.literature_review.literature_review import literature_review
 
 def test_literature_review():
     """Test the literature review function with a simple query."""
