@@ -48,10 +48,20 @@ class TestRerank:
     def test_rerank_input_output_size_match(self):
         """Test that rerank returns the same number of papers as input."""
         query = "Find me papers about ResNet architecture."
-        paper_titles = [paper.title for paper in self.sample_papers]
         
-        result = rerank(query, paper_titles)
-        assert result[0].title == "ResNet: Deep Residual Learning for Image Recognition", "Relevant paper (ResNet) filtered to top"
+        result = rerank(query, self.sample_papers)
+        
+        # Check that we get the same number of papers back
+        assert len(result) == len(self.sample_papers), "Should return same number of papers"
+        
+        # Check that ResNet paper is ranked highest for this query
+        assert result[0].title == "ResNet: Deep Residual Learning for Image Recognition", "Relevant paper (ResNet) should be ranked highest"
+    
+    def test_rerank_empty_input(self):
+        """Test that rerank handles empty input gracefully."""
+        query = "test query"
+        result = rerank(query, [])
+        assert result == [], "Should return empty list for empty input"
 
 if __name__ == "__main__":
     pytest.main([__file__])
