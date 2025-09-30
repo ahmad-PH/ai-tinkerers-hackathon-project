@@ -587,14 +587,37 @@ def _paper_hash_key(title: str, url: str | None) -> str:
 
 def render_cards(papers: list[Paper], namespace: str):
     for i, p in enumerate(papers, start=1):
-        key_struct = _paper_key(p.title, p.url)  # for feedback storage
-        key_hash = _paper_hash_key(p.title, p.url)  # for Streamlit widget keys
+        # Stable keys: one for state (by title+url), one hashed for Streamlit widgets
+        key_struct = _paper_key(p.title, p.url)
+        key_hash = _paper_hash_key(p.title, p.url)
         vote = st.session_state.paper_feedback.get(key_struct, {}).get("vote")
 
         with st.container(border=True):
+            # Title
             st.markdown(f"### {i}. {p.title}")
-            # ... meta, abstract, why_relevant, etc. unchanged ...
 
+            # Authors (+ optional year)
+            authors = ", ".join(p.authors) if isinstance(p.authors, list) and p.authors else ""
+            year_str = f" ({p.year})" if isinstance(p.year, int) and p.year > 0 else ""
+            if authors or year_str:
+                st.caption(f"{authors}{year_str}")
+
+            # URL (or DOI fallback)
+            if p.url:
+                st.markdown(f"[Open paper]({p.url})")
+            elif p.doi:
+                st.markdown(f"[Open via DOI](https://doi.org/{p.doi})")
+
+            # Abstract (collapsible)
+            if p.abstract:
+                with st.expander("Abstract", expanded=False):
+                    st.write(p.abstract)
+
+            # Optional short rationale
+            if getattr(p, "why_relevant", ""):
+                st.caption(f"Why relevant: {p.why_relevant}")
+
+            # Feedback buttons
             c1, c2 = st.columns([1, 1])
             with c1:
                 if st.button("👍 Like", key=f"like_{namespace}_{key_hash}", disabled=(vote == "like")):
@@ -730,6 +753,7 @@ if prompt:
             )
 
             st.session_state.last_ranked_papers = [p if isinstance(p, Paper) else Paper(**p) for p in ranked]
+            st.session_state.show_synthesis_buttons = True
             # Render as cards & store as an assistant turn (structured)
             render_cards(st.session_state.last_ranked_papers, namespace="live")
             st.session_state.messages.append(
@@ -740,34 +764,29 @@ if prompt:
             )
 
 
-def _get_selected_for_synthesis() -> list[Paper]:
-    ranked = st.session_state.get("last_ranked_papers") or []
-    if not ranked:
-        return []
-
-    # 1) liked papers
+def _get_selected_for_synthesis(top_k_default: int = None) -> list[Paper]:
     liked = []
-    for p in ranked:
-        k = _paper_key(p.title, p.url)
-        if st.session_state.paper_feedback.get(k, {}).get("vote") == "like":
+    for p in st.session_state.get("last_ranked_papers", []):
+        key = f"{p.title.strip()}|{p.url or ''}"
+        vote = st.session_state.paper_feedback.get(key, {}).get("vote")
+        if vote == "like":
             liked.append(p)
-
     if liked:
         return liked
-
-    # 2) fallback: top-k current ranked
-    k = st.session_state.get("last_top_k", len(ranked))
-    return ranked[:k]
+    # fallback to top-k from session (captured at query time)
+    k = st.session_state.get("last_top_k") or top_k_default or len(st.session_state.get("last_ranked_papers", []))
+    return st.session_state.get("last_ranked_papers", [])[:k]
 
 
 # -----------------------------------------------------------------------------
 # Rerank button + synthesis buttons
 # -----------------------------------------------------------------------------
-if st.session_state.get("last_ranked_papers"):
+
+if st.session_state.get("last_ranked_papers") and st.session_state.get("show_synthesis_buttons", False):
     with st.container():
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
-            if st.button("🔀 Rerank with feedback"):
+            if st.button("🔀 Rerank with feedback", key="btn_rerank_after"):
                 # Build feedback vector aligned with current list
                 feedback_vec = []
                 for p in st.session_state.last_ranked_papers:
@@ -775,6 +794,8 @@ if st.session_state.get("last_ranked_papers"):
                     vote = st.session_state.paper_feedback.get(key, {}).get("vote")
                     score = 1 if vote == "like" else (-1 if vote == "dislike" else 0)
                     feedback_vec.append(score)
+                    st.session_state.show_synthesis_buttons = True
+                    st.rerun()
                 try:
                     user_query = ""
                     # Find last user message content
@@ -803,9 +824,11 @@ if st.session_state.get("last_ranked_papers"):
                     {"role": "assistant", "content": {"papers": [p.model_dump() for p in new_rank]}}
                 )
                 st.session_state.last_ranked_papers = new_rank
+                st.session_state.show_synthesis_buttons = True
+                st.rerun()
 
         with c2:
-            if st.button("🧭 Generate Gap Analysis"):
+            if st.button("🧭 Generate Gap Analysis", key="btn_gap_after"):
                 selected = _get_selected_for_synthesis()
                 if not selected:
                     st.warning("No papers to analyze yet.")
@@ -814,7 +837,7 @@ if st.session_state.get("last_ranked_papers"):
                     user_query = next(
                         (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"), ""
                     )
-                    payload = RetrievalSet(papers=selected, notes="selected for gap").model_dump()
+                    payload = RetrievalSet(papers=selected, notes="ranked subset").model_dump()
                     gap_input = f"CONTEXT:\n{user_query}\n\nRETRIEVED_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
                     gap_content = types.Content(role="user", parts=[types.Part(text=gap_input)])
                     with st.chat_message("assistant"):
@@ -831,7 +854,7 @@ if st.session_state.get("last_ranked_papers"):
                             st.session_state.messages.append({"role": "assistant", "content": gap_md or "_No output_"})
 
         with c3:
-            if st.button("📝 Generate Literature Review"):
+            if st.button("📝 Generate Literature Review", key="btn_review_after"):
                 selected = _get_selected_for_synthesis()
                 if not selected:
                     st.warning("No papers to review yet.")
