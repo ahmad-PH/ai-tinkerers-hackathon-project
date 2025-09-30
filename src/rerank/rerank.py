@@ -210,7 +210,7 @@ def rerank(query: str, papers: List[Paper], user_feedbacks: Optional[List[float]
     paper_scores = []
     for i, paper in enumerate(papers):
         # Combine title and abstract for better context
-        paper_text = f"{paper.title}. {paper.abstract}"
+        paper_text = f"Title: {paper.title}\n\nAbstract: {paper.abstract}"
         paper_embedding = get_embedding(paper_text)
         
         similarity = cosine_similarity(query_embedding, paper_embedding)

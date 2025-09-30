@@ -17,8 +17,8 @@ from google.genai import types
 from mcp import StdioServerParameters
 from opik import configure
 from opik.integrations.adk import OpikTracer
+from prompt import papers_prompt
 from src.rerank.rerank import Paper, rerank
-
 configure()
 
 load_dotenv()  # Load environment variables from .env file if present
@@ -65,16 +65,7 @@ def create_agent():
     agent = LlmAgent(
         model="gemini-2.5-flash-lite",
         name="research_assistant",
-        instruction="""You are a research assistant that helps users find academic papers.
-
-When the user provides a research topic or question:
-1. Use the arXiv search tools to find relevant papers
-2. Present the results in a clear, organized format
-3. Include: title, authors, publication date, abstract summary, and arXiv link
-4. Prioritize recent papers (last 2-3 years) when relevant
-5. If the user asks for a specific number of papers, try to provide that many
-
-Format your responses as markdown for better readability.""",
+        instruction=papers_prompt,
         tools=[
             McpToolset(
                 connection_params=StdioConnectionParams(
