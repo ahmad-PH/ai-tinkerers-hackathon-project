@@ -1,0 +1,7 @@
+---
+alwaysApply: true
+---
+
+- The dependency manager for the package is `uv`, by Astral. Here: https://docs.astral.sh/uv/
+
+- When you want to run tests, do `uv run pytest`.
