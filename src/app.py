@@ -58,8 +58,8 @@ def create_agent():
     tracer = create_tracer()
 
     agent = LlmAgent(
-        model='gemini-2.5-flash-lite',
-        name='research_assistant',
+        model="gemini-2.5-flash-lite",
+        name="research_assistant",
         instruction="""You are a research assistant that helps users find academic papers.
 
 When the user provides a research topic or question:
@@ -74,8 +74,8 @@ Format your responses as markdown for better readability.""",
             McpToolset(
                 connection_params=StdioConnectionParams(
                     server_params=StdioServerParameters(
-                        command='uv',
-                        args=['tool', 'run', 'arxiv-mcp-server'],
+                        command="uv",
+                        args=["tool", "run", "arxiv-mcp-server"],
                     ),
                     timeout=60.0,
                 )
@@ -104,7 +104,11 @@ def create_runner():
     )
 
     # 👇 CREATE the session once (sync-friendly)
-    asyncio.run(session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID))
+    asyncio.run(
+        session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
+        )
+    )
 
     return runner
 
@@ -114,10 +118,10 @@ st.title("📚 Research Assistant")
 st.markdown("*Powered by ADK + arXiv MCP*")
 
 # Initialize session state
-if 'messages' not in st.session_state:
+if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if 'runner' not in st.session_state:
+if "runner" not in st.session_state:
     with st.spinner("Initializing research assistant..."):
         st.session_state.agent = create_agent()
         st.session_state.runner = create_runner()
@@ -175,11 +179,15 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
                 )
 
                 message_placeholder.markdown(final_text)
-                st.session_state.messages.append({"role": "assistant", "content": final_text})
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": final_text}
+                )
             except Exception as e:
                 error_msg = f"❌ Error: {str(e)}\n\nPlease try rephrasing your query or check that the arXiv MCP server is working correctly."
                 message_placeholder.markdown(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": error_msg}
+                )
 
 # Sidebar with example queries and info
 with st.sidebar:

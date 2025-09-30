@@ -5,11 +5,13 @@ description = "AI Tinkerers x Google Cloud Hackathon Project"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "arxiv>=2.2.0",
     "google-adk>=1.15.1",
     "gradio>=5.47.2",
     "litellm>=1.77.5",
     "opik>=1.8.59",
     "pyzotero>=1.6.16",
+    "streamlit>=1.50.0",
     "streamlit>=1.50.0",
 ]
 
