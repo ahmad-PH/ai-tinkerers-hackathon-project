@@ -185,7 +185,7 @@ def export_to_zotero(papers: list[Paper], collection_key: str | None = None, dry
                     for k, v in (created.get("successful") or {}).items():
                         res["created"].append({"key": k, "title": v.get("data", {}).get("title", "")})
                     # show failures per-item if any
-                    for k, v in (created.get("failed") or {}).items():
+                    for _, v in (created.get("failed") or {}).items():
                         title = v.get("data", {}).get("title", "")
                         err = v.get("error", "unknown error")
                         res["failed"].append((title, f"create failed: {err}"))
