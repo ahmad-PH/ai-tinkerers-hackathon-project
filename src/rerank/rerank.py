@@ -101,10 +101,6 @@ def rerank(query: str, papers: List[Paper], user_feedbacks: Optional[List[bool]]
     
     # Sort papers by similarity score (descending)
     paper_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    print("Papers and their scores, each on new line: ")
-    for paper, score in paper_scores:
-        print(f"{paper} - {score}")
 
     # Return papers in order of relevance
     return [paper for paper, score in paper_scores]
