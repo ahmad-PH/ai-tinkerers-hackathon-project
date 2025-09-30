@@ -79,7 +79,16 @@ Format your responses as markdown for better readability.""",
                     ),
                     timeout=60.0,
                 )
-            )
+            ),
+            McpToolset(
+                connection_params=StdioConnectionParams(
+                    server_params=StdioServerParameters(
+                        command="uv",
+                        args=["tool", "run", "zotero-mcp"],
+                    ),
+                    timeout=60.0,
+                )
+            ),
         ],
         before_agent_callback=tracer.before_agent_callback,
         after_agent_callback=tracer.after_agent_callback,
@@ -104,11 +113,7 @@ def create_runner():
     )
 
     # 👇 CREATE the session once (sync-friendly)
-    asyncio.run(
-        session_service.create_session(
-            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
-        )
-    )
+    asyncio.run(session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID))
 
     return runner
 
@@ -179,15 +184,11 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
                 )
 
                 message_placeholder.markdown(final_text)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": final_text}
-                )
+                st.session_state.messages.append({"role": "assistant", "content": final_text})
             except Exception as e:
                 error_msg = f"❌ Error: {str(e)}\n\nPlease try rephrasing your query or check that the arXiv MCP server is working correctly."
                 message_placeholder.markdown(error_msg)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_msg}
-                )
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
 # Sidebar with example queries and info
 with st.sidebar:
