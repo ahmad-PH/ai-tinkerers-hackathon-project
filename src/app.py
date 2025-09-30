@@ -1,5 +1,6 @@
 # app.py
 import asyncio
+import logging
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -10,8 +11,16 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.genai import types
 from mcp import StdioServerParameters
+from opik import configure
+from opik.integrations.adk import OpikTracer
+
+configure()
 
 load_dotenv()  # Load environment variables from .env file if present
+
+# Reduce noise from ADK/MCP internals; keep warnings+errors
+for noisy in ("mcp", "google.adk.tools.mcp_tool", "google.adk", "httpx"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 APP_NAME = "research_assistant_app"
 USER_ID = "local_user"
@@ -21,10 +30,33 @@ SESSION_ID = "default_session"
 st.set_page_config(page_title="Research Assistant", page_icon="📚", layout="wide")
 
 
+@st.cache_resource
+def get_asyncio_runner() -> asyncio.Runner:
+    # One runner (and event loop) for the lifetime of the Streamlit session
+    return asyncio.Runner()
+
+
+@st.cache_resource
+def create_tracer():
+    # You can tweak these fields (tags, metadata, project_name) to your needs.
+    return OpikTracer(
+        name="research-assistant-tracer",
+        tags=["streamlit", "arxiv", "mcp", "adk"],
+        metadata={
+            "environment": "development",
+            "framework": "google-adk",
+            "feature": "research-assistant",
+        },
+        project_name="adk-research-assistant",
+    )
+
+
 # Initialize agent (cached to avoid recreating on every rerun)
 @st.cache_resource
 def create_agent():
     """Create the ADK agent with arXiv MCP toolset"""
+    tracer = create_tracer()
+
     agent = LlmAgent(
         model='gemini-2.5-flash-lite',
         name='research_assistant',
@@ -49,6 +81,12 @@ Format your responses as markdown for better readability.""",
                 )
             )
         ],
+        before_agent_callback=tracer.before_agent_callback,
+        after_agent_callback=tracer.after_agent_callback,
+        before_model_callback=tracer.before_model_callback,
+        after_model_callback=tracer.after_model_callback,
+        before_tool_callback=tracer.before_tool_callback,
+        after_tool_callback=tracer.after_tool_callback,
     )
     return agent
 
@@ -91,6 +129,25 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+
+async def _run_turn_async(runner, user_id, session_id, content):
+    final_text_parts = []
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=content,
+    ):
+        # collect all text so we don't warn about non-text parts
+        if event.content and event.content.parts:
+            for p in event.content.parts:
+                if getattr(p, "text", None):
+                    final_text_parts.append(p.text)
+        if event.is_final_response():
+            break
+    txt = "".join(final_text_parts).strip()
+    return txt or "I couldn't produce a response this time."
+
+
 # Chat input
 if prompt := st.chat_input("What research topic would you like to explore?"):
     # Add user message to chat history
@@ -106,31 +163,23 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
 
         with st.spinner("Searching arXiv..."):
             try:
-                # Prepare ADK content
                 content = types.Content(role="user", parts=[types.Part(text=prompt)])
-                final_text = None
-                for event in st.session_state.runner.run(
-                    user_id=st.session_state.user_id, session_id=st.session_state.session_id, new_message=content
-                ):
-                    if event.is_final_response():
-                        if event.content and event.content.parts:
-                            final_text = event.content.parts[0].text
-                        break
+                runner = get_asyncio_runner()
+                final_text = runner.run(
+                    _run_turn_async(
+                        st.session_state.runner,
+                        st.session_state.user_id,
+                        st.session_state.session_id,
+                        content,
+                    )
+                )
 
-                if not final_text:
-                    final_text = "I couldn't produce a response this time."
-
-                # Display response
                 message_placeholder.markdown(final_text)
-
-                # Add assistant response to chat history
                 st.session_state.messages.append({"role": "assistant", "content": final_text})
-
             except Exception as e:
                 error_msg = f"❌ Error: {str(e)}\n\nPlease try rephrasing your query or check that the arXiv MCP server is working correctly."
                 message_placeholder.markdown(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
 
 # Sidebar with example queries and info
 with st.sidebar:
