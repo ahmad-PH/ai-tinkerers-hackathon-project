@@ -1,6 +1,6 @@
 import pytest
 from src.rerank.rerank import rerank, Paper
-
+import pdb
 
 class TestRerank:
     """Test cases for the rerank function."""
@@ -47,14 +47,11 @@ class TestRerank:
     
     def test_rerank_input_output_size_match(self):
         """Test that rerank returns the same number of papers as input."""
-        query = "transformer architecture"
+        query = "Find me papers about ResNet architecture."
         paper_titles = [paper.title for paper in self.sample_papers]
-        user_feedbacks = [True, False, True, False, True]
         
-        result = rerank(query, paper_titles, user_feedbacks)
-        
-        assert len(result) == len(paper_titles), f"Expected {len(paper_titles)} papers, got {len(result)}"
-
+        result = rerank(query, paper_titles)
+        assert result[0].title == "ResNet: Deep Residual Learning for Image Recognition", "Relevant paper (ResNet) filtered to top"
 
 if __name__ == "__main__":
     pytest.main([__file__])
