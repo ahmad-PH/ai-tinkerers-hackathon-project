@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+- When asked to install/remove packages/libraries, use the UV package manager by Astral, NOT pip. Here: https://docs.astral.sh/uv/concepts/projects/dependencies/
