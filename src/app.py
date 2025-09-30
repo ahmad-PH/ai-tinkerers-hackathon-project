@@ -89,6 +89,85 @@ def list_zotero_collections() -> list[tuple[str, str]]:
         return []
 
 
+# ---- Zotero export helpers ---------------------------------------------------
+
+
+def _split_author(name: str) -> dict:
+    """Very light name splitter for Zotero creators."""
+    name = (name or "").strip()
+    if not name:
+        return {"creatorType": "author", "firstName": "", "lastName": ""}
+    # If name contains comma, assume "Last, First"
+    if "," in name:
+        last, first = [x.strip() for x in name.split(",", 1)]
+        return {"creatorType": "author", "firstName": first, "lastName": last}
+    # Else assume last token is last name
+    parts = name.split()
+    if len(parts) == 1:
+        return {"creatorType": "author", "firstName": "", "lastName": parts[0]}
+    return {"creatorType": "author", "firstName": " ".join(parts[:-1]), "lastName": parts[-1]}
+
+
+def export_papers_to_zotero(
+    papers: list[Paper], collection_key: str | None = None, add_tag: str = "ADK Imported"
+) -> tuple[int, list[str]]:
+    """
+    Export Paper -> Zotero items via pyzotero. Returns (created_count, error_messages).
+    """
+    z = get_zotero_client()
+    if not z:
+        return (0, ["Zotero client not available: pyzotero not installed or env vars missing."])
+
+    items_payload = []
+    for p in papers:
+        creators = [_split_author(a) for a in (p.authors or [])]
+        # Minimal Zotero item; default to 'journalArticle'. Use 'preprint' if arXiv id obvious.
+        item_type = (
+            "preprint"
+            if (p.id or "").lower().startswith(("arxiv", "arxiv:", "http", "240", "23"))
+            else "journalArticle"
+        )
+        date_str = str(p.year) if isinstance(p.year, int) and p.year > 0 else ""
+
+        item = {
+            "itemType": item_type,
+            "title": p.title or "(untitled)",
+            "creators": creators,
+            "abstractNote": p.abstract or "",
+            "date": date_str,
+            "DOI": p.doi or "",
+            "url": p.url or "",
+            "language": "",
+            "libraryCatalog": "arXiv" if (p.source or "").lower() == "arxiv" else "",
+            "accessDate": "",
+            "tags": [{"tag": add_tag}],
+            "collections": [{"key": collection_key}] if collection_key else [],
+            "extra": (f"arXiv:{p.id}" if (p.id and "arxiv" in (p.source or "").lower()) else ""),
+        }
+        items_payload.append(item)
+
+    created = 0
+    errors: list[str] = []
+    # pyzotero accepts a list to create multiple items
+    try:
+        # Batch create in chunks of 25 to be safe
+        for i in range(0, len(items_payload), 25):
+            chunk = items_payload[i : i + 25]
+            resp = z.create_items(chunk)
+            # pyzotero returns a dict with 'successful' and 'failed'
+            succ = (resp or {}).get("successful", {})
+            fail = (resp or {}).get("failed", {})
+            created += len(succ)
+            if fail:
+                for _, f in fail.items():
+                    msg = (f or {}).get("message") or "Unknown error"
+                    errors.append(str(msg))
+    except Exception as e:
+        errors.append(f"Create failed: {e}")
+
+    return (created, errors)
+
+
 def mcp_toolset(command: str, args: list[str], env: dict | None = None, timeout: float = 60.0):
     return McpToolset(
         connection_params=StdioConnectionParams(
@@ -489,6 +568,36 @@ def to_retrieval_set(data: dict) -> RetrievalSet:
     return RetrievalSet(**normalized)
 
 
+def _parse_zotero_markdown(md: str) -> list[dict]:
+    """Turn Zotero MCP markdown listing into minimal Paper dicts."""
+    titles = []
+    for m in re.finditer(r"^##\s*\d+\.\s*(.+)$", md, flags=re.MULTILINE):
+        t = m.group(1).strip()
+        # skip obvious attachments/notes
+        if t.lower().endswith(".pdf"):
+            continue
+        if t.lower().startswith("untitled"):
+            continue
+        titles.append(t)
+
+    papers = []
+    for t in titles:
+        papers.append(
+            {
+                "source": "zotero",
+                "id": "",
+                "title": t,
+                "authors": [],
+                "year": -1,
+                "doi": "",
+                "url": "",
+                "abstract": "",
+                "why_relevant": "",
+            }
+        )
+    return papers
+
+
 # -----------------------------------------------------------------------------
 # UI: sidebar
 # -----------------------------------------------------------------------------
@@ -677,6 +786,19 @@ def run_pipeline(user_prompt: str, cfg: dict) -> RetrievalSet | None:
         except Exception:
             json_obj = None
 
+    # 🔁 Zotero-markdown fallback (safe for non-Zotero: condition won’t match)
+    if json_obj is None:
+        rt = (raw_text or "").lstrip()
+        looks_like_zotero_md = (
+            rt.startswith("# Items in Collection")
+            or ("**Item Key:**" in rt and rt.startswith("#"))
+            or re.search(r"^##\s*\d+\.\s+.+", rt, flags=re.MULTILINE)
+        )
+        if looks_like_zotero_md:
+            parsed = _parse_zotero_markdown(rt)
+            if parsed:
+                json_obj = {"papers": parsed, "notes": "Parsed from Zotero markdown list."}
+
     # If still None, try the structurer repair once
     if json_obj is None:
         struct_input = f"Please convert the following into valid RetrievalSet JSON only:\n\n{raw_text}"
@@ -783,7 +905,7 @@ def _get_selected_for_synthesis(top_k_default: int = None) -> list[Paper]:
 
 if st.session_state.get("last_ranked_papers") and st.session_state.get("show_synthesis_buttons", False):
     with st.container():
-        c1, c2, c3 = st.columns([1, 1, 1])
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
         with c1:
             if st.button("🔀 Rerank with feedback", key="btn_rerank_after"):
                 # 1) Build feedback vector (NO reruns in this loop)
@@ -826,6 +948,7 @@ if st.session_state.get("last_ranked_papers") and st.session_state.get("show_syn
                 )
                 st.session_state.last_ranked_papers = new_rank
                 st.session_state.show_synthesis_buttons = True
+                st.session_state.did_rerank = True
 
                 # 5) Now refresh once (AFTER state updates)
                 st.rerun()
@@ -884,6 +1007,23 @@ if st.session_state.get("last_ranked_papers") and st.session_state.get("show_syn
                             st.session_state.messages.append(
                                 {"role": "assistant", "content": review_md or "_No output_"}
                             )
+        with c4:
+            if st.session_state.get("did_rerank", False):  # only show after rerank
+                if st.button("📥 Export to Zotero", key="btn_export_zotero"):
+                    selected = _get_selected_for_synthesis()
+                    if not selected:
+                        st.warning("No papers to export.")
+                    else:
+                        # Optional: honor sidebar selection if present
+                        target_collection = selected_collection_key or ""
+                        created, errors = export_papers_to_zotero(selected, collection_key=target_collection)
+                        if created:
+                            st.success(
+                                f"Exported {created} paper(s) to Zotero"
+                                + (f" in collection {selected_collection_name}" if target_collection else "")
+                            )
+                        if errors:
+                            st.error("Some items failed to export:\n- " + "\n- ".join(errors))
 
 
 # -----------------------------------------------------------------------------
