@@ -767,13 +767,12 @@ if prompt:
 def _get_selected_for_synthesis(top_k_default: int = None) -> list[Paper]:
     liked = []
     for p in st.session_state.get("last_ranked_papers", []):
-        key = f"{p.title.strip()}|{p.url or ''}"
-        vote = st.session_state.paper_feedback.get(key, {}).get("vote")
+        k = _paper_key(p.title, p.url)  # <— match render_cards/_paper_key
+        vote = st.session_state.paper_feedback.get(k, {}).get("vote")
         if vote == "like":
             liked.append(p)
     if liked:
         return liked
-    # fallback to top-k from session (captured at query time)
     k = st.session_state.get("last_top_k") or top_k_default or len(st.session_state.get("last_ranked_papers", []))
     return st.session_state.get("last_ranked_papers", [])[:k]
 
@@ -787,22 +786,23 @@ if st.session_state.get("last_ranked_papers") and st.session_state.get("show_syn
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             if st.button("🔀 Rerank with feedback", key="btn_rerank_after"):
-                # Build feedback vector aligned with current list
+                # 1) Build feedback vector (NO reruns in this loop)
                 feedback_vec = []
                 for p in st.session_state.last_ranked_papers:
-                    key = _paper_key(p.title, p.url)
-                    vote = st.session_state.paper_feedback.get(key, {}).get("vote")
+                    k = _paper_key(p.title, p.url)  # keep this consistent with render_cards
+                    vote = st.session_state.paper_feedback.get(k, {}).get("vote")
                     score = 1 if vote == "like" else (-1 if vote == "dislike" else 0)
                     feedback_vec.append(score)
-                    st.session_state.show_synthesis_buttons = True
-                    st.rerun()
+
+                # 2) Get the most recent user query
+                user_query = ""
+                for m in reversed(st.session_state.messages):
+                    if m["role"] == "user":
+                        user_query = m["content"]
+                        break
+
+                # 3) Rerank (handle both Paper and dict inputs)
                 try:
-                    user_query = ""
-                    # Find last user message content
-                    for m in reversed(st.session_state.messages):
-                        if m["role"] == "user":
-                            user_query = m["content"]
-                            break
                     new_rank = rerank(
                         query=user_query,
                         papers=st.session_state.last_ranked_papers,
@@ -816,17 +816,19 @@ if st.session_state.get("last_ranked_papers") and st.session_state.get("show_syn
                     )
                     new_rank = [Paper(**(p if isinstance(p, dict) else p.__dict__)) for p in new_rank]
 
-                # New assistant turn with reordered cards
+                # 4) Render and persist
                 with st.chat_message("assistant"):
                     st.markdown("### Reranked (with feedback)")
-                    render_cards(new_rank, namespace="reranked")
+                    render_cards(new_rank, namespace=f"reranked_{len(st.session_state.messages)}")
+
                 st.session_state.messages.append(
                     {"role": "assistant", "content": {"papers": [p.model_dump() for p in new_rank]}}
                 )
                 st.session_state.last_ranked_papers = new_rank
                 st.session_state.show_synthesis_buttons = True
-                st.rerun()
 
+                # 5) Now refresh once (AFTER state updates)
+                st.rerun()
         with c2:
             if st.button("🧭 Generate Gap Analysis", key="btn_gap_after"):
                 selected = _get_selected_for_synthesis()
