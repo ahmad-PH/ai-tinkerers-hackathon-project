@@ -235,6 +235,66 @@ def _parse_paper_block(paper_md: str) -> dict:
     }
 
 
+def _is_probable_paper_block(paper_md: str) -> bool:
+    """Heuristics to decide whether a markdown block looks like a paper.
+
+    Indicators include:
+    - Has a recognizable title (heading or Title:)
+    - Contains Authors: or Abstract: or an arxiv link/id
+    - Has more than one non-empty line and doesn't look like a generic intro
+    """
+    lines = [l.strip() for l in paper_md.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    title = extract_title_from_markdown(paper_md)
+    lower_first = lines[0].lower()
+    # Exclude common intro-like phrases
+    intro_prefixes = (
+        "here are", "below are", "i found", "summary", "reranked papers",
+        "introduction", "results:", "we found",
+    )
+    if any(title.lower().startswith(p) for p in intro_prefixes):
+        return False
+    if any(lower_first.startswith(p) for p in intro_prefixes):
+        return False
+    text = "\n".join(lines).lower()
+    indicators = (
+        "authors:",
+        "abstract:",
+        "arxiv.org",
+        "doi.org",
+        "pdf",
+        "title:",
+    )
+    if any(ind in text for ind in indicators):
+        return True
+    # Fallback: title length heuristic
+    return len(title) >= 8
+
+
+def _score_for_title(normalized_title: str) -> int:
+    """Aggregate score for a title across all feedback entries.
+
+    Prefers like (1) over dislike (-1) over neutral (0) if conflicting entries exist.
+    """
+    has_like = False
+    has_dislike = False
+    for fb in st.session_state.paper_feedback.values():
+        fb_title = normalize_title(fb.get("title") or "Untitled")
+        if fb_title != normalized_title:
+            continue
+        vote = fb.get("vote")
+        if vote == "like":
+            has_like = True
+        elif vote == "dislike":
+            has_dislike = True
+    if has_like:
+        return 1
+    if has_dislike:
+        return -1
+    return 0
+
+
 def _render_assistant_response(markdown_text: str, namespace: str) -> None:
     """Render assistant markdown as paper boxes with like/dislike.
 
@@ -247,6 +307,10 @@ def _render_assistant_response(markdown_text: str, namespace: str) -> None:
 
     parsed_papers: list[dict] = []
     for idx, paper_md in enumerate(papers, start=1):
+        if not _is_probable_paper_block(paper_md):
+            # render non-paper blocks plainly and skip feedback controls
+            st.markdown(paper_md)
+            continue
         with st.container(border=True):
             st.markdown(paper_md)
 
@@ -312,7 +376,8 @@ def _render_assistant_response(markdown_text: str, namespace: str) -> None:
 
     # If rendering live results, store for rerank use
     if namespace == "live":
-        st.session_state.last_papers = parsed_papers
+        # keep only probable papers for rerank
+        st.session_state.last_papers = [p for p in parsed_papers if _is_probable_paper_block(p["raw"])]
 
 
 def save_feedback_to_file(path: str) -> tuple[bool, str]:
@@ -453,6 +518,42 @@ if prompt := st.chat_input("What research topic would you like to explore?"):
                 st.session_state.messages.append(
                     {"role": "assistant", "content": error_msg}
                 )
+
+# Persistent rerank controls (visible after any live result with parsed papers)
+if st.session_state.get("last_papers") and st.session_state.get("last_query"):
+    with st.expander("Rerank based on your likes/dislikes", expanded=False):
+        col_r1, col_r2 = st.columns([1, 5])
+        with col_r1:
+            if st.button("🔀 Rerank now", key="btn_rerank_persistent"):
+                query = st.session_state.get("last_query", "")
+                papers_data = st.session_state.get("last_papers", [])
+
+                paper_objs: list[Paper] = []
+                feedbacks: list[int] = []
+                for p in papers_data:
+                    paper_objs.append(
+                        Paper(
+                            title=p.get("title") or "Untitled",
+                            authors=p.get("authors") or [],
+                            abstract=p.get("abstract") or "",
+                            pdf_url=p.get("pdf_url"),
+                            entry_id=p.get("entry_id"),
+                        )
+                    )
+                    # Map current feedback by matching title in session entries
+                    norm_title = normalize_title(p.get("title") or "Untitled")
+                    feedbacks.append(_score_for_title(norm_title))
+                    print("feeed", feedbacks)
+                try:
+                    reranked = rerank(query=query, papers=paper_objs, user_feedbacks=feedbacks)
+                    md_lines = ["### Reranked Papers", ""]
+                    for i, rp in enumerate(reranked, start=1):
+                        md_lines.append(f"{i}. {rp.title}")
+                    reranked_md = "\n".join(md_lines)
+                    st.session_state.messages.append({"role": "assistant", "content": reranked_md})
+                    st.success("Added reranked list to the conversation.")
+                except Exception as ex:
+                    st.error(f"Rerank failed: {ex}")
 
 # Sidebar with example queries and info
 with st.sidebar:
