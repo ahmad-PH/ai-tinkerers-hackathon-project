@@ -1,10 +1,10 @@
 # app.py
 import asyncio
-import re
 import hashlib
 import json
-import os
 import logging
+import os
+import re
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -17,13 +17,25 @@ from google.genai import types
 from mcp import StdioServerParameters
 from opik import configure
 from opik.integrations.adk import OpikTracer
-from prompt import papers_prompt
+from pydantic import BaseModel, Field
+
+# Optional pyzotero for better collection picker
+try:
+    from pyzotero import zotero as pyzotero_mod
+
+    HAVE_PYZOTERO = True
+except Exception:
+    HAVE_PYZOTERO = False
+
+# Your reranker
 from src.rerank.rerank import Paper, rerank
+
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
 configure()
+load_dotenv()
 
-load_dotenv()  # Load environment variables from .env file if present
-
-# Reduce noise from ADK/MCP internals; keep warnings+errors
 for noisy in ("mcp", "google.adk.tools.mcp_tool", "google.adk", "httpx"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -31,52 +43,154 @@ APP_NAME = "research_assistant_app"
 USER_ID = "local_user"
 SESSION_ID = "default_session"
 
-# Page config
 st.set_page_config(page_title="Research Assistant", page_icon="📚", layout="wide")
 
 
+class RetrievalSet(BaseModel):
+    papers: list[Paper] = Field(default_factory=list)
+    notes: str = ""
+
+    # model_config = ConfigDict(extra='forbid')
+
+
+# -----------------------------------------------------------------------------
+# Helpers: env & MCP toolsets
+# -----------------------------------------------------------------------------
+
+
+def zotero_env_ok() -> bool:
+    return bool(os.getenv("ZOTERO_USER_ID") and os.getenv("ZOTERO_API_KEY"))
+
+
+def get_zotero_client():
+    if not HAVE_PYZOTERO or not zotero_env_ok():
+        return None
+    lib_type = os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    user_id = os.getenv("ZOTERO_USER_ID")
+    api_key = os.getenv("ZOTERO_API_KEY")
+    try:
+        return pyzotero_mod.Zotero(user_id, lib_type, api_key)
+    except Exception:
+        return None
+
+
+def list_zotero_collections() -> list[tuple[str, str]]:
+    z = get_zotero_client()
+    if not z:
+        return []
+    try:
+        cols = z.collections()
+        out = []
+        for c in cols:
+            data = c.get("data", {})
+            out.append((data.get("name", "Untitled"), data.get("key", "")))
+        return out
+    except Exception:
+        return []
+
+
+def mcp_toolset(command: str, args: list[str], env: dict | None = None, timeout: float = 60.0):
+    return McpToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(command=command, args=args, env=env or {}),
+            timeout=timeout,
+        )
+    )
+
+
+def arxiv_mcp_toolset():
+    return mcp_toolset("uv", ["tool", "run", "arxiv-mcp-server"])
+
+
+def zotero_mcp_toolset():
+    # Provide both expected env names to be safe across repos
+    env = {
+        "ZOTERO_LIBRARY_ID": os.getenv("ZOTERO_USER_ID", ""),
+        "ZOTERO_USER_ID": os.getenv("ZOTERO_USER_ID", ""),
+        "ZOTERO_API_KEY": os.getenv("ZOTERO_API_KEY", ""),
+        "ZOTERO_LIBRARY_TYPE": os.getenv("ZOTERO_LIBRARY_TYPE", "user"),
+        "ZOTERO_LOCAL": os.getenv("ZOTERO_LOCAL", "false"),
+    }
+    # Common CLI name in your repo is "zotero-mcp"; adjust if needed
+    return mcp_toolset("uvx", ["zotero-mcp"], env=env)
+
+
+def ping_badge(ok: bool) -> str:
+    return "✅" if ok else "❌"
+
+
+# -----------------------------------------------------------------------------
+# Streamlit caches: runner + tracer
+# -----------------------------------------------------------------------------
 @st.cache_resource
 def get_asyncio_runner() -> asyncio.Runner:
-    # One runner (and event loop) for the lifetime of the Streamlit session
+    # One event loop for the lifetime of the Streamlit session
     return asyncio.Runner()
 
 
 @st.cache_resource
 def create_tracer():
-    # You can tweak these fields (tags, metadata, project_name) to your needs.
     return OpikTracer(
         name="research-assistant-tracer",
-        tags=["streamlit", "arxiv", "mcp", "adk"],
-        metadata={
-            "environment": "development",
-            "framework": "google-adk",
-            "feature": "research-assistant",
-        },
+        tags=["streamlit", "arxiv", "zotero", "mcp", "adk"],
+        metadata={"environment": "development", "framework": "google-adk", "feature": "research-assistant"},
         project_name="adk-research-assistant",
     )
 
 
-# Initialize agent (cached to avoid recreating on every rerun)
-@st.cache_resource
-def create_agent():
-    """Create the ADK agent with arXiv MCP toolset"""
-    tracer = create_tracer()
+# -----------------------------------------------------------------------------
+# Agents
+# -----------------------------------------------------------------------------
 
-    agent = LlmAgent(
+
+def create_retriever_agent(tracer, arxiv_ts, zotero_ts):
+    instruction = """You are a retrieval-focused research assistant.
+
+# OUTPUT POLICY — IMPORTANT
+Return *only* a single JSON object inside one fenced code block. No prose before/after.
+If a field is unknown, use "" (empty string) or 0 for year. Follow the exact keys in the schema.
+
+Goal: return MANY relevant papers as structured content for downstream use. You may call tools multiple times (ReAct-style).
+No clustering. Be explicit and iterative up to CONFIG.search_iterations.
+
+Behavior:
+1) If CONFIG.use_zotero=true:
+   a) Use Zotero MCP to list seed items (collection key OR tag; respect CONFIG.zotero_recent).
+   b) For each seed item, try:
+      (i) Read attached PDF to extract title + abstract (or first paragraph).
+      (ii) Else fetch abstract from arXiv by title/DOI.
+      (iii) Else fallback to Zotero metadata.
+   c) Produce a 1–2 sentence theme summary in "notes".
+
+2) Expansion (iterative up to CONFIG.search_iterations):
+   - Formulate focused arXiv queries; enforce CONFIG.cutoff.
+   - On each iteration: search, add unique candidates, deduplicate, refine queries.
+   - Stop at ~CONFIG.top_k or iteration cap.
+
+Schema to emit (keys must match exactly):
+{
+  "papers": [
+    {
+      "source": "arxiv or zotero",
+      "id": "string",
+      "title": "string",
+      "authors": ["..."],
+      "year": 2024,             // -1 if unknown
+      "doi": "string",
+      "url": "string",
+      "abstract": "string",
+      "why_relevant": "string"
+    }
+  ],
+  "notes": "string"
+}
+"""
+    return LlmAgent(
         model="gemini-2.5-flash-lite",
-        name="research_assistant",
-        instruction=papers_prompt,
-        tools=[
-            McpToolset(
-                connection_params=StdioConnectionParams(
-                    server_params=StdioServerParameters(
-                        command="uv",
-                        args=["tool", "run", "arxiv-mcp-server"],
-                    ),
-                    timeout=60.0,
-                )
-            )
-        ],
+        name="retriever_agent",
+        instruction=instruction,
+        tools=[arxiv_ts, zotero_ts],
+        output_schema=RetrievalSet,
         before_agent_callback=tracer.before_agent_callback,
         after_agent_callback=tracer.after_agent_callback,
         before_model_callback=tracer.before_model_callback,
@@ -84,546 +198,671 @@ def create_agent():
         before_tool_callback=tracer.before_tool_callback,
         after_tool_callback=tracer.after_tool_callback,
     )
-    return agent
 
 
+def create_structurer_agent(tracer):
+    # We’ll still parse JSON locally, but we tell the model to strictly emit the schema
+    return LlmAgent(
+        model="gemini-2.5-flash",
+        name="structurer_agent",
+        instruction=(
+            "Convert the user's previous text into a strict RetrievalSet JSON (no commentary).\n"
+            "If fields are missing, fill with empty strings or nulls appropriately. "
+            "Keep abstracts as-is (no truncation). Output only the JSON."
+        ),
+        # No tools
+        before_agent_callback=tracer.before_agent_callback,
+        after_agent_callback=tracer.after_agent_callback,
+        before_model_callback=tracer.before_model_callback,
+        after_model_callback=tracer.after_model_callback,
+    )
+
+
+def create_gap_agent(tracer):
+    instruction = """You are a gap-analysis agent.
+
+Given JSON with a list of retrieved papers (title, abstract, year, doi/url) and the original idea/context,
+produce a concise gap analysis (no clustering). Focus on:
+- patterns/themes,
+- inconsistencies or contradictions,
+- under-explored populations/settings/methods/data,
+- measurement or reproducibility limitations,
+- concrete opportunities (testable directions).
+
+Output markdown with sections:
+- **Idea recap** (1–2 sentences)
+- **Patterns observed** (3–5 bullets with inline refs by title or DOI)
+- **Inconsistencies / limitations** (3–5 bullets with refs)
+- **Under-explored opportunities** (4–8 bullets; each bullet cites 1–2 supporting papers)
+- **Suggested next-read list** (10–15 items as Title (Year) — link)
+Keep it tight and grounded to the provided papers. If the list is small, say so and be conservative."""
+    return LlmAgent(
+        model="gemini-2.5-pro",
+        name="gap_agent",
+        instruction=instruction,
+        tools=[],
+        before_agent_callback=tracer.before_agent_callback,
+        after_agent_callback=tracer.after_agent_callback,
+        before_model_callback=tracer.before_model_callback,
+        after_model_callback=tracer.after_model_callback,
+    )
+
+
+def create_review_agent(tracer):
+    instruction = """You are a literature-review writing agent.
+
+Given JSON with retrieved papers and the research idea/context, draft a literature review section suitable for a paper.
+No clustering. Structure:
+
+**Background & scope**: 1 paragraph tying the idea to major strands
+**Synthesis of prior work**: 2–4 short paragraphs organized by themes/methods,
+  weaving in citations by Title (Year) or DOI (avoid numeric citations).
+**Methods & data seen**: 1 short paragraph (common study designs/datasets)
+**Gaps motivating new work**: 1 paragraph (reference the earlier synthesis)
+
+Keep it 400–700 words. Maintain academic tone but crisp. Ground claims with references to specific papers from the provided list."""
+    return LlmAgent(
+        model="gemini-2.5-pro",
+        name="review_agent",
+        instruction=instruction,
+        tools=[],
+        before_agent_callback=tracer.before_agent_callback,
+        after_agent_callback=tracer.after_agent_callback,
+        before_model_callback=tracer.before_model_callback,
+        after_model_callback=tracer.after_model_callback,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Agent + runner factory
+# -----------------------------------------------------------------------------
 @st.cache_resource
-def create_runner():
-    # use cached agent, so this does not re-create
-    agent = create_agent()
+def create_agents_and_runners():
+    tracer = create_tracer()
+    arxiv_ts = arxiv_mcp_toolset()
+    zotero_ts = zotero_mcp_toolset()
 
-    session_service = InMemorySessionService()
-    runner = Runner(
-        agent=agent,
-        app_name=APP_NAME,
-        session_service=session_service,
-    )
+    retriever = create_retriever_agent(tracer, arxiv_ts, zotero_ts)
+    structurer = create_structurer_agent(tracer)
+    gap = create_gap_agent(tracer)
+    review = create_review_agent(tracer)
 
-    # 👇 CREATE the session once (sync-friendly)
-    asyncio.run(
-        session_service.create_session(
-            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
+    sess = InMemorySessionService()
+    run_retriever = Runner(agent=retriever, app_name=APP_NAME, session_service=sess)
+    run_structurer = Runner(agent=structurer, app_name=APP_NAME, session_service=sess)
+    run_gap = Runner(agent=gap, app_name=APP_NAME, session_service=sess)
+    run_review = Runner(agent=review, app_name=APP_NAME, session_service=sess)
+
+    asyncio.run(sess.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID + "_retriever"))
+    asyncio.run(sess.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID + "_structurer"))
+    asyncio.run(sess.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID + "_gap"))
+    asyncio.run(sess.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID + "_review"))
+
+    return (retriever, structurer, gap, review, run_retriever, run_structurer, run_gap, run_review)
+
+
+# -----------------------------------------------------------------------------
+# Async runner helper
+# -----------------------------------------------------------------------------
+# async def _run_turn_async(runner, user_id, session_id, content):
+#     final_text_parts = []
+#     async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
+#         if event.content and event.content.parts:
+#             for p in event.content.parts:
+#                 if getattr(p, "text", None):
+#                     final_text_parts.append(p.text)
+#         if event.is_final_response():
+#             break
+#     return "".join(final_text_parts).strip() or ""
+
+
+async def _run_turn_async(runner, user_id, session_id, content):
+    def _extract_texts_from_parts(parts) -> list[str]:
+        texts: list[str] = []
+
+        for p in parts or []:
+            # 1) Normal model text parts
+            txt = getattr(p, "text", None)
+            if isinstance(txt, str) and txt.strip():
+                texts.append(txt)
+                continue
+
+            # 2) Tool / function responses (ADK wraps these as Pydantic objects)
+            fr = getattr(p, "function_response", None)
+            if fr is None:
+                # Some builds embed the tool result directly in the part
+                # (keep this as a no-op if not present)
+                continue
+
+            # Normalize: prefer attribute access, then dict fallback
+            resp = getattr(fr, "response", None)
+            if resp is None and isinstance(fr, dict):
+                resp = fr.get("response")
+
+            # ADK sometimes exposes result either under response.result or directly as fr.result
+            result = getattr(resp, "result", None) if resp is not None else None
+            if result is None:
+                result = getattr(fr, "result", None)
+            if result is None and isinstance(resp, dict):
+                result = resp.get("result")
+
+            # Now drill into the content list (attribute or dict)
+            content_list = None
+            if result is not None:
+                content_list = getattr(result, "content", None)
+                if content_list is None and isinstance(result, dict):
+                    content_list = result.get("content")
+
+            # Some tools return a simple string instead of a content list
+            if content_list is None and result is not None:
+                alt_text = getattr(result, "text", None)
+                if alt_text is None and isinstance(result, dict):
+                    alt_text = result.get("text")
+                if isinstance(alt_text, str) and alt_text.strip():
+                    texts.append(alt_text)
+                    continue
+
+            # Typical MCP shape: list of items with type/text
+            for c in content_list or []:
+                if isinstance(c, dict):
+                    ctype = c.get("type")
+                    ctext = c.get("text")
+                    if ctype == "text" and isinstance(ctext, str) and ctext.strip():
+                        texts.append(ctext)
+                else:
+                    ctype = getattr(c, "type", None)
+                    ctext = getattr(c, "text", None)
+                    if ctype == "text" and isinstance(ctext, str) and ctext.strip():
+                        texts.append(ctext)
+
+        return texts
+
+    final_texts: list[str] = []
+    last_tool_texts: list[str] = []
+
+    async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
+        ec = getattr(event, "content", None)
+        if ec is not None and getattr(ec, "parts", None):
+            # Plain model text
+            for p in ec.parts:
+                pt = getattr(p, "text", None)
+                if isinstance(pt, str) and pt.strip():
+                    final_texts.append(pt)
+            # Tool text (important)
+            ttexts = _extract_texts_from_parts(ec.parts)
+            if ttexts:
+                last_tool_texts = ttexts
+
+        if event.is_final_response():
+            break
+
+    txt = "".join(final_texts).strip()
+    if not txt and last_tool_texts:
+        txt = "\n\n".join(last_tool_texts).strip()
+    return txt or ""
+
+
+# -----------------------------------------------------------------------------
+# JSON extraction + structuring
+# -----------------------------------------------------------------------------
+JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+
+
+def extract_json_block(text: str) -> dict | None:
+    m = JSON_BLOCK_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
+
+
+def _year_from_any(v) -> int:
+    """Extract a 4-digit year or return -1 if unknown."""
+    if isinstance(v, int):
+        return v
+    if not v:
+        return -1
+    # try ISO date first
+    try:
+        return int(str(v)[:4])
+    except Exception:
+        pass
+    m = re.search(r"\b(19|20)\d{2}\b", str(v))
+    return int(m.group(0)) if m else -1
+
+
+def to_retrieval_set(data: dict) -> RetrievalSet:
+    """
+    Normalize heterogeneous tool output into the strict RetrievalSet schema.
+    - If it's already compliant, pass through.
+    - If it's arXiv MCP-style, map fields and fill defaults.
+    """
+    if not isinstance(data, dict):
+        data = {}  # avoid NoneType splats
+
+    raw_papers = data.get("papers") or []
+
+    # Quick path: looks already compliant (has "source" on first item)
+    if raw_papers and isinstance(raw_papers[0], dict) and "source" in raw_papers[0]:
+        return RetrievalSet(**data)
+
+    # Normalize arXiv-shape to your schema
+    norm_papers = []
+    for p in raw_papers:
+        if not isinstance(p, dict):
+            continue
+        arxiv_id = p.get("id") or ""
+        title = p.get("title") or ""
+        authors = p.get("authors") or []
+        abstract = p.get("abstract") or ""
+        published = p.get("published") or p.get("date") or ""
+        url = p.get("url") or f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else ""
+        doi = p.get("doi") or ""
+        why_rel = p.get("why_relevant") or ""  # tools usually won't provide this
+
+        # Ensure authors is a list[str]
+        if isinstance(authors, str):
+            authors = [a.strip() for a in re.split(r",| and ", authors) if a.strip()]
+        elif not isinstance(authors, list):
+            authors = []
+
+        norm_papers.append(
+            {
+                "source": "arxiv",  # arXiv MCP doesn't set this
+                "id": arxiv_id,
+                "title": title,
+                "authors": authors,
+                "year": _year_from_any(published),  # int (or -1)
+                "doi": doi,
+                "url": url,
+                "abstract": abstract,
+                "why_relevant": why_rel,
+            }
         )
-    )
 
-    return runner
-
-
-# --- Helpers to render papers nicely in separate boxes ---
-def _split_markdown_into_papers(markdown_text: str) -> list[str]:
-    """Best-effort segmentation of assistant markdown into paper-sized chunks.
-
-    Heuristics:
-    - Split on blank lines that precede common paper starters: headings (###/##),
-      numbered items (1.), bullets (- or *), or explicit "Title:" markers.
-    - If nothing reasonable is found, return a single chunk.
-    """
-    if not markdown_text:
-        return []
-
-    text = markdown_text.strip()
-
-    # Try splitting where a new paper likely starts
-    chunks = re.split(r"\n\s*\n(?=\s*(?:#{2,3}\s|\d+\.\s|[-*]\s|Title:))", text)
-
-    # Post-filter: keep meaningful chunks
-    cleaned = [c.strip() for c in chunks if c and c.strip()]
-
-    # If the split was too aggressive or not helpful, fallback to a simpler rule:
-    if len(cleaned) <= 1:
-        alt = re.split(r"\n\s*\n\s*\n+", text)  # split on big paragraph gaps
-        alt_cleaned = [c.strip() for c in alt if c and c.strip()]
-        if len(alt_cleaned) > 1:
-            cleaned = alt_cleaned
-
-    # Final sanity: if still just one, return as single block
-    return cleaned if cleaned else [text]
+    normalized = {
+        "papers": norm_papers,
+        "notes": data.get("notes") or "",
+    }
+    return RetrievalSet(**normalized)
 
 
-def extract_title_from_markdown(paper_md: str) -> str:
-    """Extract a likely title from a paper markdown block.
+# -----------------------------------------------------------------------------
+# UI: sidebar
+# -----------------------------------------------------------------------------
+st.title("📚 Research Assistant")
+st.caption("Google ADK • arXiv MCP • Zotero MCP • Opik")
 
-    Priority:
-    - First heading line starting with ### or ##
-    - Line starting with Title:
-    - First non-empty line (trimmed)
-    """
-    lines = [l.strip() for l in paper_md.splitlines() if l.strip()]
-    for l in lines:
-        if l.startswith("### ") or l.startswith("## "):
-            return normalize_title(l.lstrip('#').strip())
-    for l in lines:
-        if l.lower().startswith("title:"):
-            return normalize_title(l.split(":", 1)[1].strip() or "Untitled")
-    return normalize_title(lines[0]) if lines else "Untitled"
+with st.sidebar:
+    st.header("🔧 Mode & Sources")
+    mode = st.radio("Start from", ["Idea", "Zotero"], index=0, horizontal=True)
+    use_zotero = st.checkbox("Use Zotero seeds", value=(mode == "Zotero"))
+
+    selected_collection_key = ""
+    selected_collection_name = ""
+    z_tag = ""
+    z_recent = 20
+
+    if use_zotero:
+        if zotero_env_ok():
+            st.success(f"Zotero creds found {ping_badge(True)}")
+            if HAVE_PYZOTERO:
+                cols = list_zotero_collections()
+                if cols:
+                    selected = st.selectbox("Zotero collection", options=cols, format_func=lambda x: x[0], index=0)
+                    selected_collection_name, selected_collection_key = selected
+                else:
+                    st.warning("No collections found via pyzotero. You can still specify a tag below.")
+            else:
+                st.warning("pyzotero not installed; using text inputs instead.")
+        else:
+            st.error(f"Zotero not configured {ping_badge(False)} — set ZOTERO_USER_ID and ZOTERO_API_KEY")
+
+        z_tag = st.text_input("Optional Zotero tag", placeholder="e.g. diffusion")
+        z_recent = st.number_input("Recent N items", min_value=0, max_value=100, value=20, step=5)
+
+    st.markdown("### Retrieval controls")
+    top_k = st.slider("Top-k papers", min_value=3, max_value=50, value=10, step=5)
+    cutoff = st.text_input("Date cutoff (YYYY-MM-DD, optional)", placeholder="e.g. 2023-12-31")
+    search_iterations = st.slider("Search iterations (ReAct depth)", 1, 3, value=2, step=1)
+
+    st.markdown("---")
+    st.caption(f"arXiv MCP: {ping_badge(True)} (assumes CLI available)")
+    st.caption(f"Zotero MCP: {ping_badge(zotero_env_ok())}")
+
+    if st.button("🗑️ Clear Chat"):
+        st.session_state.pop("messages", None)
+        st.session_state.pop("paper_feedback", None)
+        st.session_state.pop("last_ranked_papers", None)
+        st.rerun()
+
+# -----------------------------------------------------------------------------
+# Session init
+# -----------------------------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "paper_feedback" not in st.session_state:
+    st.session_state.paper_feedback = {}  # key -> {'vote': 'like'|'dislike'|None}
+if "user_id" not in st.session_state:
+    st.session_state.user_id = USER_ID
+if "session_id" not in st.session_state:
+    st.session_state.session_id = SESSION_ID
+
+# Multi-agent runners (create once)
+if "runner_retriever" not in st.session_state:
+    with st.spinner("Initializing multi-agent pipeline…"):
+        (
+            st.session_state.agent_retriever,
+            st.session_state.agent_structurer,
+            st.session_state.agent_gap,
+            st.session_state.agent_review,
+            st.session_state.runner_retriever,
+            st.session_state.runner_structurer,
+            st.session_state.runner_gap,
+            st.session_state.runner_review,
+        ) = create_agents_and_runners()
+
+# -----------------------------------------------------------------------------
+# Render history
+# -----------------------------------------------------------------------------
 
 
-def normalize_title(raw: str) -> str:
-    """Remove markdown syntax and ordering from a title-like string.
-
-    - Strip link markup: [text](url) -> text
-    - Remove leading heading hashes, list markers, and numeric prefixes (e.g., "1. ")
-    - Remove common emphasis/backtick wrappers and collapse whitespace
-    """
-    if not raw:
-        return "Untitled"
-
-    s = raw.strip()
-    # Remove link markdown
-    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\\1", s)
-    # Remove heading markers (if any remain)
-    s = s.lstrip('#').strip()
-    # Remove list/numeric prefixes like "1. ", "- ", "* ", "+ "
-    s = re.sub(r"^(?:\d+\.\s+|[-*+]\s+)", "", s)
-    # Strip surrounding emphasis/backticks
-    s = s.strip("*_` ")
-    # Collapse internal whitespace
+def normalize_title(s: str) -> str:
+    s = s or "Untitled"
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s).strip()
+    s = re.sub(r"^(?:\d+\.\s+|[-*+]\s+|#+\s+)", "", s).strip("*_` ").strip()
     s = re.sub(r"\s+", " ", s)
     return s or "Untitled"
 
 
-def _paper_key_from_markdown(paper_md: str) -> str:
-    """Generate a stable key for a paper based on content hash."""
-    digest = hashlib.sha256(paper_md.strip().encode("utf-8")).hexdigest()
-    return f"paper_{digest[:16]}"
+def _paper_key(title: str, url: str | None) -> str:
+    return f"{normalize_title(title)}|{url or ''}"
 
 
-def _parse_paper_block(paper_md: str) -> dict:
-    """Heuristic parse of a paper markdown block into a minimal dict.
+def _paper_hash_key(title: str, url: str | None) -> str:
+    return hashlib.sha1(_paper_key(title, url).encode("utf-8")).hexdigest()[:10]
 
-    Attempts to extract title, authors (list), abstract, pdf_url, entry_id (if present).
-    """
-    title = extract_title_from_markdown(paper_md)
-    authors: list[str] = []
-    abstract = ""
-    pdf_url = None
-    entry_id = None
 
-    # Simple heuristics
-    lines = [l.strip() for l in paper_md.splitlines()]
-    for i, line in enumerate(lines):
-        lower = line.lower()
-        if lower.startswith("authors:"):
-            authors_str = line.split(":", 1)[1].strip()
-            authors = [a.strip() for a in re.split(r",| and ", authors_str) if a.strip()]
-        elif lower.startswith("abstract:"):
-            abstract = line.split(":", 1)[1].strip()
-        elif "arxiv.org" in lower and "http" in lower:
-            # crude URL capture
-            m = re.search(r"https?://[^\s)]+", line)
-            if m:
-                pdf_url = m.group(0)
-        elif lower.startswith("id:") or lower.startswith("entry_id:"):
-            entry_id = line.split(":", 1)[1].strip()
+def render_cards(papers: list[Paper], namespace: str):
+    for i, p in enumerate(papers, start=1):
+        key_struct = _paper_key(p.title, p.url)  # for feedback storage
+        key_hash = _paper_hash_key(p.title, p.url)  # for Streamlit widget keys
+        vote = st.session_state.paper_feedback.get(key_struct, {}).get("vote")
 
-    return {
-        "title": title,
-        "authors": authors,
-        "abstract": abstract,
-        "pdf_url": pdf_url,
-        "entry_id": entry_id,
-        "raw": paper_md,
+        with st.container(border=True):
+            st.markdown(f"### {i}. {p.title}")
+            # ... meta, abstract, why_relevant, etc. unchanged ...
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("👍 Like", key=f"like_{namespace}_{key_hash}", disabled=(vote == "like")):
+                    st.session_state.paper_feedback[key_struct] = {"vote": "like"}
+                    st.rerun()
+            with c2:
+                if st.button("👎 Dislike", key=f"dislike_{namespace}_{key_hash}", disabled=(vote == "dislike")):
+                    st.session_state.paper_feedback[key_struct] = {"vote": "dislike"}
+                    st.rerun()
+
+
+for idx, msg in enumerate(st.session_state.messages):
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant" and isinstance(msg.get("content"), dict) and msg["content"].get("papers"):
+            render_cards(
+                [Paper(**p) if isinstance(p, dict) else p for p in msg["content"]["papers"]],
+                namespace=f"hist_{idx}",  # unique per message
+            )
+        else:
+            st.markdown(msg["content"] if isinstance(msg["content"], str) else str(msg["content"]))
+
+
+# -----------------------------------------------------------------------------
+# Orchestrator: one turn
+# -----------------------------------------------------------------------------
+
+
+def run_pipeline(user_prompt: str, cfg: dict) -> RetrievalSet | None:
+    loop_runner = get_asyncio_runner()
+
+    # 1) RETRIEVE
+    retriever_content = types.Content(
+        role="user",
+        parts=[
+            types.Part(
+                text=("CONFIG:\n" + "\n".join(f"{k}={v}" for k, v in cfg.items()) + "\n\nUSER:\n" + user_prompt)
+            )
+        ],
+    )
+    raw_text = loop_runner.run(
+        _run_turn_async(
+            st.session_state.runner_retriever,
+            st.session_state.user_id,
+            st.session_state.session_id + "_retriever",
+            retriever_content,
+        )
+    )
+
+    # Save raw output for debugging
+    st.session_state.last_raw_retriever = raw_text
+
+    # Try several ways to get JSON
+    json_obj = extract_json_block(raw_text)
+    if json_obj is None:
+        try:
+            json_obj = json.loads(raw_text)
+        except Exception:
+            json_obj = None
+
+    # If still None, try the structurer repair once
+    if json_obj is None:
+        struct_input = f"Please convert the following into valid RetrievalSet JSON only:\n\n{raw_text}"
+        struct_content = types.Content(role="user", parts=[types.Part(text=struct_input)])
+        structured_text = loop_runner.run(
+            _run_turn_async(
+                st.session_state.runner_structurer,
+                st.session_state.user_id,
+                st.session_state.session_id + "_structurer",
+                struct_content,
+            )
+        )
+        # try parsing the repaired text
+        json_obj = extract_json_block(structured_text)
+        if json_obj is None:
+            try:
+                json_obj = json.loads(structured_text)
+            except Exception:
+                json_obj = None
+
+    # If still None, bail gracefully with an empty set (and surface raw output)
+    if json_obj is None:
+        st.warning("Retriever produced no valid JSON. See the raw output under the debug expander.")
+        return RetrievalSet(papers=[], notes="(empty)")
+
+    # Finally coerce whatever we got into a RetrievalSet (this is now null-safe)
+    retrieval = to_retrieval_set(json_obj)
+
+    # Enforce top_k
+    if cfg.get("top_k"):
+        retrieval.papers = retrieval.papers[: int(cfg["top_k"])]
+
+    return retrieval
+
+
+# -----------------------------------------------------------------------------
+# Chat input
+# -----------------------------------------------------------------------------
+
+prompt = st.chat_input("Type a research idea, topic, or a Zotero instruction…")
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.last_top_k = top_k
+    cfg = {
+        "use_zotero": str(bool(use_zotero)).lower(),
+        "zotero_collection_key": selected_collection_key or "",
+        "zotero_collection_name": selected_collection_name or "",
+        "zotero_tag": z_tag if use_zotero else "",
+        "zotero_recent": int(z_recent) if use_zotero else 0,
+        "top_k": top_k,
+        "cutoff": cutoff or "",
+        "search_iterations": search_iterations,
     }
 
-
-def _is_probable_paper_block(paper_md: str) -> bool:
-    """Heuristics to decide whether a markdown block looks like a paper.
-
-    Indicators include:
-    - Has a recognizable title (heading or Title:)
-    - Contains Authors: or Abstract: or an arxiv link/id
-    - Has more than one non-empty line and doesn't look like a generic intro
-    """
-    lines = [l.strip() for l in paper_md.splitlines() if l.strip()]
-    if len(lines) < 2:
-        return False
-    title = extract_title_from_markdown(paper_md)
-    lower_first = lines[0].lower()
-    # Exclude common intro-like phrases
-    intro_prefixes = (
-        "here are", "below are", "i found", "summary", "reranked papers",
-        "introduction", "results:", "we found",
-    )
-    if any(title.lower().startswith(p) for p in intro_prefixes):
-        return False
-    if any(lower_first.startswith(p) for p in intro_prefixes):
-        return False
-    text = "\n".join(lines).lower()
-    indicators = (
-        "authors:",
-        "abstract:",
-        "arxiv.org",
-        "doi.org",
-        "pdf",
-        "title:",
-    )
-    if any(ind in text for ind in indicators):
-        return True
-    # Fallback: title length heuristic
-    return len(title) >= 8
-
-
-def _score_for_title(normalized_title: str) -> int:
-    """Aggregate score for a title across all feedback entries.
-
-    Prefers like (1) over dislike (-1) over neutral (0) if conflicting entries exist.
-    """
-    has_like = False
-    has_dislike = False
-    for fb in st.session_state.paper_feedback.values():
-        fb_title = normalize_title(fb.get("title") or "Untitled")
-        if fb_title != normalized_title:
-            continue
-        vote = fb.get("vote")
-        if vote == "like":
-            has_like = True
-        elif vote == "dislike":
-            has_dislike = True
-    if has_like:
-        return 1
-    if has_dislike:
-        return -1
-    return 0
-
-
-def _render_assistant_response(markdown_text: str, namespace: str) -> None:
-    """Render assistant markdown as paper boxes with like/dislike.
-
-    The namespace makes Streamlit widget keys stable and unique across messages.
-    """
-    # If this is an explicit reranking summary, render plainly without feedback controls
-    first_non_empty = next((l for l in markdown_text.splitlines() if l.strip()), "").strip()
-    if first_non_empty.lower().startswith("### reranked papers"):
-        st.markdown(markdown_text)
-        return
-
-    papers = _split_markdown_into_papers(markdown_text)
-    if len(papers) <= 1:
-        st.markdown(markdown_text)
-        return
-
-    parsed_papers: list[dict] = []
-    for idx, paper_md in enumerate(papers, start=1):
-        if not _is_probable_paper_block(paper_md):
-            # render non-paper blocks plainly and skip feedback controls
-            st.markdown(paper_md)
-            continue
-        with st.container(border=True):
-            st.markdown(paper_md)
-
-            key_core = _paper_key_from_markdown(paper_md)
-            key = f"{namespace}_{key_core}"
-            if key not in st.session_state.paper_feedback:
-                # Extract a human-friendly title for export purposes
-                title = extract_title_from_markdown(paper_md)
-                # Initialize entry
-                st.session_state.paper_feedback[key] = {
-                    'likes': 0,
-                    'dislikes': 0,
-                    'vote': None,
-                    'title': title,
-                }
-                # If we have a loaded score for this title, apply it once
-                if 'title_scores' in st.session_state and title in st.session_state.title_scores:
-                    score = st.session_state.title_scores[title]
-                    if score == 1:
-                        st.session_state.paper_feedback[key]['likes'] = 1
-                        st.session_state.paper_feedback[key]['dislikes'] = 0
-                        st.session_state.paper_feedback[key]['vote'] = 'like'
-                    elif score == -1:
-                        st.session_state.paper_feedback[key]['likes'] = 0
-                        st.session_state.paper_feedback[key]['dislikes'] = 1
-                        st.session_state.paper_feedback[key]['vote'] = 'dislike'
-                    else:
-                        st.session_state.paper_feedback[key]['likes'] = 0
-                        st.session_state.paper_feedback[key]['dislikes'] = 0
-                        st.session_state.paper_feedback[key]['vote'] = None
-
-            cols = st.columns([1, 1, 6])
-            with cols[0]:
-                current_vote = st.session_state.paper_feedback[key].get('vote')
-                like_disabled = current_vote == 'like'
-                if st.button("👍 Like", key=f"like_{key}", disabled=like_disabled):
-                    # Only count if switching from no vote or from dislike
-                    if current_vote == 'dislike':
-                        st.session_state.paper_feedback[key]['dislikes'] = max(
-                            0, st.session_state.paper_feedback[key]['dislikes'] - 1
-                        )
-                    if current_vote != 'like':
-                        st.session_state.paper_feedback[key]['likes'] += 1
-                        st.session_state.paper_feedback[key]['vote'] = 'like'
-            with cols[1]:
-                current_vote = st.session_state.paper_feedback[key].get('vote')
-                dislike_disabled = current_vote == 'dislike'
-                if st.button("👎 Dislike", key=f"dislike_{key}", disabled=dislike_disabled):
-                    # Only count if switching from no vote or from like
-                    if current_vote == 'like':
-                        st.session_state.paper_feedback[key]['likes'] = max(
-                            0, st.session_state.paper_feedback[key]['likes'] - 1
-                        )
-                    if current_vote != 'dislike':
-                        st.session_state.paper_feedback[key]['dislikes'] += 1
-                        st.session_state.paper_feedback[key]['vote'] = 'dislike'
-            with cols[2]:
-                fb = st.session_state.paper_feedback[key]
-                st.caption(f"Likes: {fb['likes']} • Dislikes: {fb['dislikes']}")
-
-        # Collect parsed paper info for potential reranking
-        parsed_papers.append(_parse_paper_block(paper_md))
-
-    # If rendering live results, store for rerank use
-    if namespace == "live":
-        # keep only probable papers for rerank
-        st.session_state.last_papers = [p for p in parsed_papers if _is_probable_paper_block(p["raw"])]
-
-
-def save_feedback_to_file(path: str) -> tuple[bool, str]:
-    """Save feedback as { title: { score } } with score in {1,0,-1}."""
-    try:
-        export: dict[str, dict] = {}
-        for entry in st.session_state.paper_feedback.values():
-            title = normalize_title(entry.get('title') or 'Untitled')
-            vote = entry.get('vote')
-            if vote == 'like':
-                score = 1
-            elif vote == 'dislike':
-                score = -1
-            else:
-                score = 0
-            export[title] = {"score": score}
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(export, f, ensure_ascii=False, indent=2)
-        return True, f"Saved feedback to {path}"
-    except Exception as e:
-        return False, str(e)
-
-
-def load_feedback_from_file(path: str) -> tuple[bool, str]:
-    """Load { title: { score } }, store in session as title->score for later binding."""
-    try:
-        if not os.path.exists(path):
-            return False, "File does not exist"
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                return False, "Invalid file format"
-
-            # Convert into a simpler mapping: title -> score
-            title_scores: dict[str, int] = {}
-            for title, obj in data.items():
-                title = normalize_title(title)
-                if isinstance(obj, dict) and "score" in obj:
-                    score = obj["score"]
-                    if score in (-1, 0, 1):
-                        title_scores[title] = score
-            st.session_state.title_scores = title_scores
-        return True, f"Loaded feedback from {path}"
-    except Exception as e:
-        return False, str(e)
-
-
-# UI Header
-st.title("📚 Research Assistant")
-st.markdown("*Powered by ADK + arXiv MCP*")
-
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if 'paper_feedback' not in st.session_state:
-    st.session_state.paper_feedback = {}
-
-if 'feedback_file' not in st.session_state:
-    # default to a file next to this app
-    st.session_state.feedback_file = os.path.join(os.path.dirname(__file__), "paper_feedback.json")
-
-if "runner" not in st.session_state:
-    with st.spinner("Initializing research assistant..."):
-        st.session_state.agent = create_agent()
-        st.session_state.runner = create_runner()
-        st.session_state.user_id = USER_ID
-        st.session_state.session_id = SESSION_ID
-
-# Display chat history
-for idx, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        if message["role"] == "assistant":
-            _render_assistant_response(message["content"], namespace=f"hist_{idx}")
-        else:
-            st.markdown(message["content"])
-
-
-async def _run_turn_async(runner, user_id, session_id, content):
-    final_text_parts = []
-    async for event in runner.run_async(
-        user_id=user_id,
-        session_id=session_id,
-        new_message=content,
-    ):
-        # collect all text so we don't warn about non-text parts
-        if event.content and event.content.parts:
-            for p in event.content.parts:
-                if getattr(p, "text", None):
-                    final_text_parts.append(p.text)
-        if event.is_final_response():
-            break
-    txt = "".join(final_text_parts).strip()
-    return txt or "I couldn't produce a response this time."
-
-
-# Chat input
-if prompt := st.chat_input("What research topic would you like to explore?"):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    # Display user message
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Get agent response
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
+        st.caption(
+            f"Run config — Zotero: {use_zotero} • "
+            f"Collection: {selected_collection_name or '—'} • "
+            f"Key: {selected_collection_key or '—'} • Tag: {z_tag or '—'} • "
+            f"Top-k: {top_k} • Iterations: {search_iterations} • Cutoff: {cutoff or '—'}"
+        )
+        placeholder = st.empty()
+        with st.spinner("Retrieving…"):
+            retrieval = run_pipeline(prompt, cfg)
 
-        with st.spinner("Searching arXiv..."):
-            try:
-                content = types.Content(role="user", parts=[types.Part(text=prompt)])
-                runner = get_asyncio_runner()
-                final_text = runner.run(
-                    _run_turn_async(
-                        st.session_state.runner,
-                        st.session_state.user_id,
-                        st.session_state.session_id,
-                        content,
-                    )
-                )
+        if retrieval is None or not retrieval.papers:
+            placeholder.markdown("No structured results found.")
+        else:
+            # First-pass rerank (no feedback)
+            ranked = rerank(
+                query=prompt,
+                papers=retrieval.papers,
+                user_feedbacks=None,
+            )
 
-                if not final_text:
-                    final_text = "I couldn't produce a response this time."
+            st.session_state.last_ranked_papers = [p if isinstance(p, Paper) else Paper(**p) for p in ranked]
+            # Render as cards & store as an assistant turn (structured)
+            render_cards(st.session_state.last_ranked_papers, namespace="live")
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": {"papers": [p.model_dump() for p in st.session_state.last_ranked_papers]},
+                }
+            )
 
-                # Display response consistently using the same renderer as history
-                with message_placeholder.container():
-                    _render_assistant_response(final_text, namespace="live")
 
-                # Add assistant response to chat history (store original markdown)
-                st.session_state.messages.append({"role": "assistant", "content": final_text})
-                # Remember last query for persistent rerank controls
-                st.session_state.last_query = prompt
-            except Exception as e:
-                error_msg = f"❌ Error: {str(e)}\n\nPlease try rephrasing your query or check that the arXiv MCP server is working correctly."
-                message_placeholder.markdown(error_msg)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_msg}
-                )
+def _get_selected_for_synthesis() -> list[Paper]:
+    ranked = st.session_state.get("last_ranked_papers") or []
+    if not ranked:
+        return []
 
-# Persistent rerank controls (visible after any live result with parsed papers)
-if st.session_state.get("last_papers") and st.session_state.get("last_query"):
-    with st.expander("Rerank based on your likes/dislikes", expanded=False):
-        col_r1, col_r2 = st.columns([1, 5])
-        with col_r1:
-            if st.button("🔀 Rerank now", key="btn_rerank_persistent"):
-                query = st.session_state.get("last_query", "")
-                papers_data = st.session_state.get("last_papers", [])
+    # 1) liked papers
+    liked = []
+    for p in ranked:
+        k = _paper_key(p.title, p.url)
+        if st.session_state.paper_feedback.get(k, {}).get("vote") == "like":
+            liked.append(p)
 
-                paper_objs: list[Paper] = []
-                feedbacks: list[int] = []
-                for p in papers_data:
-                    paper_objs.append(
-                        Paper(
-                            title=p.get("title") or "Untitled",
-                            authors=p.get("authors") or [],
-                            abstract=p.get("abstract") or "",
-                            pdf_url=p.get("pdf_url"),
-                            entry_id=p.get("entry_id"),
-                        )
-                    )
-                    # Map current feedback by matching title in session entries
-                    norm_title = normalize_title(p.get("title") or "Untitled")
-                    feedbacks.append(_score_for_title(norm_title))
-                    print("feeed", feedbacks)
+    if liked:
+        return liked
+
+    # 2) fallback: top-k current ranked
+    k = st.session_state.get("last_top_k", len(ranked))
+    return ranked[:k]
+
+
+# -----------------------------------------------------------------------------
+# Rerank button + synthesis buttons
+# -----------------------------------------------------------------------------
+if st.session_state.get("last_ranked_papers"):
+    with st.container():
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            if st.button("🔀 Rerank with feedback"):
+                # Build feedback vector aligned with current list
+                feedback_vec = []
+                for p in st.session_state.last_ranked_papers:
+                    key = _paper_key(p.title, p.url)
+                    vote = st.session_state.paper_feedback.get(key, {}).get("vote")
+                    score = 1 if vote == "like" else (-1 if vote == "dislike" else 0)
+                    feedback_vec.append(score)
                 try:
-                    reranked = rerank(query=query, papers=paper_objs, user_feedbacks=feedbacks)
-                    md_lines = ["### Reranked Papers", ""]
-                    for i, rp in enumerate(reranked, start=1):
-                        md_lines.append(f"{i}. {rp.title}")
-                    reranked_md = "\n".join(md_lines)
-                    st.session_state.messages.append({"role": "assistant", "content": reranked_md})
-                    st.success("Added reranked list to the conversation.")
-                except Exception as ex:
-                    st.error(f"Rerank failed: {ex}")
+                    user_query = ""
+                    # Find last user message content
+                    for m in reversed(st.session_state.messages):
+                        if m["role"] == "user":
+                            user_query = m["content"]
+                            break
+                    new_rank = rerank(
+                        query=user_query,
+                        papers=st.session_state.last_ranked_papers,
+                        user_feedbacks=feedback_vec,
+                    )
+                except Exception:
+                    new_rank = rerank(
+                        query=user_query,
+                        papers=[p.model_dump() for p in st.session_state.last_ranked_papers],
+                        user_feedbacks=feedback_vec,
+                    )
+                    new_rank = [Paper(**(p if isinstance(p, dict) else p.__dict__)) for p in new_rank]
 
-# Sidebar with example queries and info
-with st.sidebar:
-    st.header("📖 Quick Start")
+                # New assistant turn with reordered cards
+                with st.chat_message("assistant"):
+                    st.markdown("### Reranked (with feedback)")
+                    render_cards(new_rank, namespace="reranked")
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": {"papers": [p.model_dump() for p in new_rank]}}
+                )
+                st.session_state.last_ranked_papers = new_rank
 
-    st.markdown("### Example Queries")
+        with c2:
+            if st.button("🧭 Generate Gap Analysis"):
+                selected = _get_selected_for_synthesis()
+                if not selected:
+                    st.warning("No papers to analyze yet.")
+                else:
+                    loop_runner = get_asyncio_runner()
+                    user_query = next(
+                        (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"), ""
+                    )
+                    payload = RetrievalSet(papers=selected, notes="selected for gap").model_dump()
+                    gap_input = f"CONTEXT:\n{user_query}\n\nRETRIEVED_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+                    gap_content = types.Content(role="user", parts=[types.Part(text=gap_input)])
+                    with st.chat_message("assistant"):
+                        with st.spinner("Generating gap analysis…"):
+                            gap_md = loop_runner.run(
+                                _run_turn_async(
+                                    st.session_state.runner_gap,
+                                    st.session_state.user_id,
+                                    st.session_state.session_id + "_gap",
+                                    gap_content,
+                                )
+                            )
+                            st.markdown(gap_md or "_No output_")
+                            st.session_state.messages.append({"role": "assistant", "content": gap_md or "_No output_"})
 
-    example_queries = [
-        "Find recent papers on transformer architectures",
-        "Show me 5 papers about federated learning privacy",
-        "What are the latest developments in vision transformers?",
-        "Search for papers on reinforcement learning from human feedback",
-    ]
+        with c3:
+            if st.button("📝 Generate Literature Review"):
+                selected = _get_selected_for_synthesis()
+                if not selected:
+                    st.warning("No papers to review yet.")
+                else:
+                    loop_runner = get_asyncio_runner()
+                    user_query = next(
+                        (m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"), ""
+                    )
+                    payload = RetrievalSet(papers=selected, notes="selected for review").model_dump()
+                    review_input = (
+                        f"CONTEXT:\n{user_query}\n\nRETRIEVED_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+                    )
+                    review_content = types.Content(role="user", parts=[types.Part(text=review_input)])
+                    with st.chat_message("assistant"):
+                        with st.spinner("Drafting literature review…"):
+                            review_md = loop_runner.run(
+                                _run_turn_async(
+                                    st.session_state.runner_review,
+                                    st.session_state.user_id,
+                                    st.session_state.session_id + "_review",
+                                    review_content,
+                                )
+                            )
+                            st.markdown(review_md or "_No output_")
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": review_md or "_No output_"}
+                            )
 
-    for query in example_queries:
-        if st.button(query, key=query):
-            # Trigger a rerun with the example query
-            st.session_state.messages.append({"role": "user", "content": query})
-            st.rerun()
 
-    st.markdown("---")
-
-    st.markdown("### How to Use")
-    st.markdown("""
-    1. Enter your research topic or question
-    2. The assistant will search arXiv
-    3. View organized results with paper details
-    4. Click on arXiv links to read full papers
-    """)
-
-    st.markdown("---")
-
-    st.markdown("### About")
-    st.markdown("""
-    This assistant uses:
-    - **Google ADK** for agent orchestration
-    - **arXiv MCP Server** for paper search
-    - **Gemini 2.0 Flash** for intelligent responses
-    """)
-
-    if st.button("Clear Chat History"):
-        st.session_state.messages = []
-        st.rerun()
-
-    if st.button("Reset Feedback Counts"):
-        st.session_state.paper_feedback = {}
-        st.experimental_rerun()
-
-    st.markdown("---")
-    st.markdown("### Save/Load Feedback")
-    st.session_state.feedback_file = st.text_input("Feedback file path", st.session_state.feedback_file)
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("💾 Save Feedback"):
-            ok, msg = save_feedback_to_file(st.session_state.feedback_file)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
-    with col_b:
-        if st.button("📂 Load Feedback"):
-            ok, msg = load_feedback_from_file(st.session_state.feedback_file)
-            if ok:
-                st.success(msg)
-                st.experimental_rerun()
-            else:
-                st.error(msg)
-
+# -----------------------------------------------------------------------------
 # Footer
+# -----------------------------------------------------------------------------
 st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: gray; font-size: 0.8em;'>"
-    "Built with Streamlit • Powered by Google ADK"
-    "</div>",
-    unsafe_allow_html=True,
-)
+st.caption("Built with Streamlit • Google ADK • arXiv/Zotero MCP • Opik")
