@@ -51,8 +51,6 @@ class RetrievalSet(BaseModel):
     papers: list[Paper] = Field(default_factory=list)
     notes: str = ""
 
-    # model_config = ConfigDict(extra='forbid')
-
 
 # -----------------------------------------------------------------------------
 # Helpers: env & MCP toolsets
@@ -447,16 +445,6 @@ def create_agents_and_runners():
 # -----------------------------------------------------------------------------
 # Async runner helper
 # -----------------------------------------------------------------------------
-# async def _run_turn_async(runner, user_id, session_id, content):
-#     final_text_parts = []
-#     async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
-#         if event.content and event.content.parts:
-#             for p in event.content.parts:
-#                 if getattr(p, "text", None):
-#                     final_text_parts.append(p.text)
-#         if event.is_final_response():
-#             break
-#     return "".join(final_text_parts).strip() or ""
 
 
 async def _run_turn_async(runner, user_id, session_id, content):

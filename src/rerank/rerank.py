@@ -32,7 +32,7 @@ class Paper(BaseModel):
     year: int = -1
     doi: str = ""
     url: str = ""
-    abstract: str = ""  # unlimited
+    abstract: str = ""
     why_relevant: str = ""
 
 
